@@ -1,0 +1,543 @@
+```{r}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(writexl)
+
+folder <- "C:/Users/ranve/Documents/Bioinformatics/Individual project"
+
+
+#Births
+births <- read_excel(file.path(folder, "only_birth.xlsx"))
+names(births) <- trimws(names(births))
+
+births <- births %>%
+  rename(area_code = 1) %>%
+  mutate(area_code = as.character(area_code),
+         births = as.numeric(gsub(",", "", `Number of live births`)),
+         stillbirths = as.numeric(gsub(",", "", `Number of stillbirths`))) %>%
+  filter(str_detect(area_code, "^E")) %>%
+  group_by(area_code) %>%
+  summarise(
+    births = sum(births, na.rm = TRUE),
+    stillbirths = sum(stillbirths, na.rm = TRUE),
+    stillbirth_rate_per_1000 = ifelse(births > 0, (stillbirths / births) * 1000, NA_real_),
+    .groups = "drop")
+
+
+#IMD
+imd <- imd_raw %>%
+  mutate(area_code = as.character(Local.Authority.District.code..2024.),
+         IMD_rank = as.numeric(Index.of.Multiple.Deprivation..IMD..Rank..where.1.is.most.deprived.)) %>%
+  filter(!is.na(area_code), area_code != "") %>%
+  group_by(area_code) %>%
+  summarise(IMD_rank = median(IMD_rank, na.rm = TRUE), .groups = "drop")
+
+
+#Ethnicity
+eth_summary <- read_excel(file.path(folder, "ethnicities.xlsx")) %>%
+  setNames(make.names(trimws(names(.)))) %>%
+  mutate(area_code = as.character(Lower.Tier.Local.Authorities.Code),
+         ethnic_group = as.character(Ethnic.Group..detailed...288.categories.),
+         value = as.numeric(Observation),
+         is_white = str_detect(ethnic_group, regex("^White", ignore_case = TRUE))) %>%
+  filter(!is.na(area_code), area_code != "") %>%
+  group_by(area_code) %>%
+  summarise(
+    total_pop = sum(value, na.rm = TRUE),
+    white_pop = sum(value[is_white], na.rm = TRUE),
+    ethnic_minority_pop = sum(value[!is_white], na.rm = TRUE),
+    ethnic_minority_pct = ifelse(total_pop > 0,
+                                 round(100 * ethnic_minority_pop / total_pop, 2),
+                                 NA_real_),
+    .groups = "drop")
+
+
+#Merging IMD and ethnicity
+final <- births %>%
+  left_join(imd, by = "area_code") %>%
+  left_join(eth_summary, by = "area_code")
+
+#Remove rows with missing deprivation or ethnicity data
+final <- final %>%
+  filter(!is.na(IMD_rank),
+         !is.na(ethnic_minority_pct))
+
+#Export output
+write_xlsx(final, file.path(folder, "final_stillbirth_dataset_2025.xlsx"))
+```
+
+
+```{r}
+library(sf)
+library(ggplot2)
+library(viridis)
+library(dplyr)
+library(stringr)
+
+#Download LAD shapefile
+url <- paste0(
+  "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/",
+  "Local_Authority_Districts_May_2024_Boundaries_UK_BGC/FeatureServer/0/query",
+  "?where=1%3D1&outFields=*&f=geojson")
+
+lad <- st_read(url, quiet = TRUE)
+
+st_write(lad, file.path(folder, "LAD_2024_UK_BGC.gpkg"), delete_dsn = TRUE)
+
+#Keep only LADs in the dataset
+final_lad <- final %>%
+  filter(str_detect(area_code, "^E"))
+
+#Join spatial data
+lad_data <- lad %>% left_join(final_lad, by = c("LAD24CD" = "area_code"))
+
+#Stillbirth plot
+stillbirth_plot <- ggplot(lad_data) +
+  geom_sf(
+    aes(fill = stillbirth_rate_per_1000),
+    colour = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    na.value = "grey95",
+    name = "Stillbirths\nper 1000"
+  ) +
+  theme_void() +
+  labs(title = "Stillbirth rate by Local Authority District")
+
+ggsave(file.path(folder, "stillbirth_rate_map.png"),
+       stillbirth_plot, width = 8, height = 10, dpi = 300)
+
+#IMD plot
+imd_plot <- ggplot(lad_data) +
+  geom_sf(
+    aes(fill = IMD_rank),
+    colour = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_viridis_c(
+    option = "magma",
+    direction = -1,
+    na.value = "grey95",
+    name = "Median\nIMD Rank"
+  ) +
+  theme_void() +
+  labs(title = "Index of Multiple Deprivation by Local Authority District")
+
+ggsave(file.path(folder, "imd_map.png"),
+       imd_plot, width = 8, height = 10, dpi = 300)
+
+#Ethnic minority plot
+ethnicity_plot <- ggplot(lad_data) +
+  geom_sf(
+    aes(fill = ethnic_minority_pct),
+    colour = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_viridis_c(
+    option = "cividis",
+    na.value = "grey95",
+    name = "Ethnic\nMinority %"
+  ) +
+  theme_void() +
+  labs(title = "Ethnic minority population (%) by Local Authority District")
+
+ggsave(file.path(folder, "ethnic_minority_map.png"),
+       ethnicity_plot, width = 8, height = 10, dpi = 300)
+```
+
+```{r}
+library(ggplot2)
+library(scales)
+
+scatter_folder <- file.path(folder, "scatter plots")
+dir.create(scatter_folder, showWarnings = FALSE)
+
+final <- final %>%
+  mutate(log_stillbirth_rate = log1p(stillbirth_rate_per_1000))
+
+#Stillbirth rate vs IMD
+imd_scatter <- ggplot(filter(final, !is.na(IMD_rank)),
+                      aes(x = IMD_rank, y = log_stillbirth_rate)) +
+  geom_point(alpha = 0.7, colour = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, colour = "red") +
+  labs(
+    title = "Stillbirth rate vs IMD rank",
+    x = "Median IMD rank (lower = more deprived)",
+    y = "Log(1 + stillbirth rate per 1,000 births)"
+  ) +
+  theme_minimal()
+
+ggsave(file.path(scatter_folder, "scatter_imd.png"),
+       imd_scatter, width = 7, height = 5, dpi = 300)
+
+#Stillbirth rate vs ethnic minority percentage
+ethnicity_scatter <- ggplot(filter(final, !is.na(ethnic_minority_pct)),
+                            aes(x = ethnic_minority_pct, y = log_stillbirth_rate)) +
+  geom_point(alpha = 0.7, colour = "purple") +
+  geom_smooth(method = "lm", se = TRUE, colour = "red") +
+  labs(
+    title = "Stillbirth rate vs ethnic minority population",
+    x = "Ethnic minority population (%)",
+    y = "Log(1 + stillbirth rate per 1,000 births)"
+  ) +
+  theme_minimal()
+
+ggsave(file.path(scatter_folder, "scatter_ethnicity.png"),
+       ethnicity_scatter, width = 7, height = 5, dpi = 300)
+```
+
+```{r}
+library(CARBayes)
+library(sf)
+library(spdep)
+library(dplyr)
+library(writexl)
+library(stringr)
+
+lad_model <- lad_data %>%
+  left_join(final, by = c("LAD24CD" = "area_code"))
+
+lad_model <- lad_model %>%
+  rename(
+    stillbirths = stillbirths.x,
+    births = births.x,
+    IMD_rank = IMD_rank.x,
+    ethnic_minority_pct = ethnic_minority_pct.x
+  )
+
+
+#Scale predictors
+lad_model <- lad_model %>%
+  mutate(
+    IMD_rank_scaled = as.numeric(scale(IMD_rank)),
+    ethnic_minority_pct_scaled = as.numeric(scale(ethnic_minority_pct))
+  )
+
+
+#England model data
+england_sf <- lad_model %>%
+  filter(
+    !is.na(IMD_rank_scaled),
+    !is.na(ethnic_minority_pct_scaled),
+    !is.na(stillbirths),
+    !is.na(births),
+    births > 0,
+    str_detect(LAD24CD, "^E")
+  )
+
+england_sf <- england_sf[card(poly2nb(england_sf, queen = TRUE)) > 0, ]
+
+england_data <- england_sf %>%
+  st_drop_geometry()
+
+england_nb <- poly2nb(england_sf, queen = TRUE)
+
+england_W <- listw2mat(nb2listw(england_nb, style = "B"))
+england_W <- (england_W + t(england_W)) / 2
+england_W <- ifelse(england_W > 0, 1, 0)
+
+
+england_model <- S.CARleroux(
+  formula = stillbirths ~ IMD_rank_scaled +
+    ethnic_minority_pct_scaled +
+    offset(log(births)),
+  family = "poisson",
+  data = england_data,
+  W = england_W,
+  burnin = 10000,
+  n.sample = 50000
+)
+
+
+#Regression coefficients and confidence intervals
+england_results <- england_model$summary.results %>%
+  as.data.frame() %>%
+  mutate(
+    parameter = rownames(.),
+    model = "England"
+  )
+
+
+beta_results <- england_results
+
+
+#Spatial correlation parameter
+spatial_results <- data.frame(
+  model = "England",
+  spatial_correlation = england_model$summary.results["rho", "Mean"]
+)
+
+
+#Unexplained spatial variance
+england_variance <- data.frame(
+  model = "England",
+  unexplained_variance = var(as.vector(england_model$samples$phi))
+)
+
+variance_results <- england_variance
+
+
+#Combine results
+CARBayes_results <- list(
+  regression_coefficients = beta_results,
+  spatial_correlation = spatial_results,
+  unexplained_variance = variance_results
+)
+
+
+write_xlsx(
+  CARBayes_results,
+  file.path(folder, "CARBayes_model_results.xlsx")
+)
+```
+
+```{r}
+library(ggplot2)
+
+#Predicted stillbirth counts
+england_data$predicted_stillbirths <- england_model$fitted.values
+
+#Observed vs predicted plot
+observed_predicted_plot <- ggplot(
+  england_data,
+  aes(x = predicted_stillbirths, y = stillbirths)
+) +
+  geom_point(colour = "steelblue", alpha = 0.7, size = 2) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    colour = "red",
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Observed vs Predicted Stillbirth Counts",
+    x = "Predicted stillbirths",
+    y = "Observed stillbirths"
+  ) +
+  theme_minimal()
+
+ggsave(
+  file.path(folder, "observed_vs_predicted.png"),
+  observed_predicted_plot,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+observed_predicted_plot
+```
+
+```{r}
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(viridis)
+
+#Define hotspot threshold (example: national average)
+threshold <- 3.9
+
+#Posterior fitted means for each LAD
+posterior_lambda <- england_model$samples$fitted
+
+#Convert to posterior stillbirth rate per 1,000 live births
+posterior_rate <- sweep(
+  posterior_lambda,
+  2,
+  england_data$births,
+  "/"
+) * 1000
+
+#Posterior probability each LAD exceeds the threshold
+hotspot_probability <- colMeans(posterior_rate > threshold)
+
+#Add probabilities to England sf object
+england_sf$hotspot_probability <- hotspot_probability
+
+#Read UK LAD map
+uk_lad <- st_read(
+  file.path(folder, "LAD_2024_UK_BGC.gpkg"),
+  quiet = TRUE
+)
+
+#Join hotspot probabilities to the UK map
+uk_map <- uk_lad %>%
+  left_join(
+    england_sf %>%
+      st_drop_geometry() %>%
+      select(LAD24CD, hotspot_probability),
+    by = "LAD24CD"
+  )
+
+#Plot
+hotspot_map <- ggplot() +
+  geom_sf(
+    data = uk_map,
+    fill = "grey90",
+    colour = "white",
+    linewidth = 0.15
+  ) +
+  geom_sf(
+    data = filter(uk_map, !is.na(hotspot_probability)),
+    aes(fill = hotspot_probability),
+    colour = "white",
+    linewidth = 0.15
+  ) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    limits = c(0, 1),
+    na.value = "grey90",
+    name = "Posterior\nprobability"
+  ) +
+  labs(
+    title = paste(
+      "Posterior probability of exceeding",
+      threshold,
+      "stillbirths per 1,000 live births"
+    )
+  ) +
+  theme_void()
+
+ggsave(
+  file.path(folder, "posterior_hotspot_probability_map.png"),
+  hotspot_map,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+hotspot_map
+```
+
+```{r}
+#MAE and RMSE
+
+library(readxl)
+library(dplyr)
+
+#LOOCV files
+
+ethnicity_LOOCV <- read_excel("LOOCV_ethnicity_model.xlsx")
+
+full_LOOCV <- read_excel("LOOCV_full_model.xlsx")
+
+IMD_LOOCV <- read_excel("LOOCV_IMD_model.xlsx")
+
+null_LOOCV <- read_excel("LOOCV_null_model.xlsx")
+
+
+#Calculate MAE and RMSE for each model
+
+#Ethnicity model
+MAE_ethnicity <- mean(
+  abs(ethnicity_LOOCV$observed - ethnicity_LOOCV$predicted),
+  na.rm = TRUE
+)
+
+RMSE_ethnicity <- sqrt(
+  mean(
+    (ethnicity_LOOCV$observed - ethnicity_LOOCV$predicted)^2,
+    na.rm = TRUE
+  )
+)
+
+
+#Full model
+MAE_full <- mean(
+  abs(full_LOOCV$observed - full_LOOCV$predicted),
+  na.rm = TRUE
+)
+
+RMSE_full <- sqrt(
+  mean(
+    (full_LOOCV$observed - full_LOOCV$predicted)^2,
+    na.rm = TRUE
+  )
+)
+
+
+#IMD model
+MAE_IMD <- mean(
+  abs(IMD_LOOCV$observed - IMD_LOOCV$predicted),
+  na.rm = TRUE
+)
+
+RMSE_IMD <- sqrt(
+  mean(
+    (IMD_LOOCV$observed - IMD_LOOCV$predicted)^2,
+    na.rm = TRUE
+  )
+)
+
+
+#Null model
+MAE_null <- mean(
+  abs(null_LOOCV$observed - null_LOOCV$predicted),
+  na.rm = TRUE
+)
+
+RMSE_null <- sqrt(
+  mean(
+    (null_LOOCV$observed - null_LOOCV$predicted)^2,
+    na.rm = TRUE
+  )
+)
+
+
+#Summary table
+
+LOOCV_results <- data.frame(
+  Model = c(
+    "Null model",
+    "IMD model",
+    "Ethnicity model",
+    "Full model"
+  ),
+  
+  MAE = c(
+    MAE_null,
+    MAE_IMD,
+    MAE_ethnicity,
+    MAE_full
+  ),
+  
+  RMSE = c(
+    RMSE_null,
+    RMSE_IMD,
+    RMSE_ethnicity,
+    RMSE_full
+  )
+)
+
+LOOCV_results <- LOOCV_results %>%
+  mutate(
+    MAE = round(MAE, 3),
+    RMSE = round(RMSE, 3)
+  )
+
+LOOCV_results
+
+#Calculate percentage improvement compared to null model
+
+
+LOOCV_results <- LOOCV_results %>%
+  mutate(
+    MAE_improvement_percent =
+      ((MAE_null - MAE) / MAE_null) * 100,
+    
+    RMSE_improvement_percent =
+      ((RMSE_null - RMSE) / RMSE_null) * 100
+  ) %>%
+  mutate(
+    MAE_improvement_percent =
+      round(MAE_improvement_percent, 2),
+    
+    RMSE_improvement_percent =
+      round(RMSE_improvement_percent, 2)
+  )
+
+LOOCV_results
+```
+

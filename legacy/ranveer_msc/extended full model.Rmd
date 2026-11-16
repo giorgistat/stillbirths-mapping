@@ -1,0 +1,873 @@
+```{r}
+library(fingertipsR)
+library(dplyr)
+library(sf)
+library(spdep)
+library(CARBayes)
+library(ggplot2)
+library(writexl)
+library(grid)
+
+
+#Smoking data
+
+smoking_data <- fingertips_data(
+  IndicatorID = 93085,
+  AreaTypeID = 501
+)
+
+smoking_2024_25 <- smoking_data %>%
+  dplyr::filter(
+    Timeperiod == "2024/25",
+    AreaType == "Districts & UAs (from Apr 2023)"
+  )
+
+smoking_clean <- smoking_2024_25 %>%
+  dplyr::select(
+    LAD24CD = AreaCode,
+    smoking_at_delivery = Value
+  )
+
+
+#Maternal age data
+
+age_data <- fingertips_data(
+  IndicatorID = 92250,
+  AreaTypeID = 501
+)
+
+age_2024_25 <- age_data %>%
+  dplyr::filter(
+    Timeperiod == "2024/25",
+    AreaType == "Districts & UAs (from Apr 2023)"
+  )
+
+age_clean <- age_2024_25 %>%
+  dplyr::select(
+    LAD24CD = AreaCode,
+    maternal_age_35plus = Value
+  )
+
+
+#Obesity data
+
+obesity_data <- fingertips_data(
+  IndicatorID = 93881,
+  AreaTypeID = 501
+)
+
+obesity_2024_25 <- obesity_data %>%
+  dplyr::filter(
+    Timeperiod == "2024/25",
+    AreaType == "Districts & UAs (from Apr 2023)"
+  )
+
+obesity_clean <- obesity_2024_25 %>%
+  dplyr::select(
+    LAD24CD = AreaCode,
+    obesity = Value
+  )
+
+
+
+#Combine data
+
+full_extension <- england_data %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM,
+    births,
+    stillbirths,
+    IMD_rank,
+    ethnic_minority_pct = ethnic_minority_pct.x
+  ) %>%
+  left_join(
+    smoking_clean,
+    by = "LAD24CD"
+  ) %>%
+  left_join(
+    age_clean,
+    by = "LAD24CD"
+  ) %>%
+  left_join(
+    obesity_clean,
+    by = "LAD24CD"
+  )
+
+
+#Check missing data
+
+missing_full_data <- full_extension %>%
+  dplyr::filter(
+    is.na(smoking_at_delivery) |
+      is.na(maternal_age_35plus) |
+      is.na(obesity)
+  ) %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM,
+    smoking_at_delivery,
+    maternal_age_35plus,
+    obesity
+  )
+
+print(
+  missing_full_data
+)
+
+
+#Full dataset
+
+full_extension_complete <- full_extension %>%
+  dplyr::filter(
+    !is.na(smoking_at_delivery),
+    !is.na(maternal_age_35plus),
+    !is.na(obesity)
+  )
+
+#Observed stillbirth rate
+
+full_extension_complete <- full_extension_complete %>%
+  mutate(
+    observed_rate_per_1000 =
+      (stillbirths / births) * 1000
+  )
+
+summary(
+  full_extension_complete$observed_rate_per_1000
+)
+
+
+#Standardise covariates
+
+full_extension_complete <- full_extension_complete %>%
+  mutate(
+    
+    IMD_scaled =
+      as.numeric(
+        scale(IMD_rank)
+      ),
+    
+    ethnicity_scaled =
+      as.numeric(
+        scale(ethnic_minority_pct)
+      ),
+    
+    smoking_scaled =
+      as.numeric(
+        scale(smoking_at_delivery)
+      ),
+    
+    age_scaled =
+      as.numeric(
+        scale(maternal_age_35plus)
+      ),
+    
+    obesity_scaled =
+      as.numeric(
+        scale(obesity)
+      )
+    
+  )
+
+
+#Match spatial data
+
+full_sf <- england_sf %>%
+  dplyr::filter(
+    LAD24CD %in%
+      full_extension_complete$LAD24CD
+  ) %>%
+  arrange(
+    match(
+      LAD24CD,
+      full_extension_complete$LAD24CD
+    )
+  )
+
+
+#Create queen neighbours
+
+full_nb <- poly2nb(
+  full_sf,
+  queen = TRUE
+)
+
+full_W <- nb2mat(
+  full_nb,
+  style = "B",
+  zero.policy = TRUE
+)
+
+rownames(full_W) <-
+  full_extension_complete$LAD24CD
+
+colnames(full_W) <-
+  full_extension_complete$LAD24CD
+
+
+#Modelling data
+
+full_model_data <-
+  full_extension_complete %>%
+  as.data.frame()
+
+
+print(
+  colSums(
+    is.na(
+      full_model_data[
+        ,
+        c(
+          "stillbirths",
+          "births",
+          "IMD_scaled",
+          "ethnicity_scaled",
+          "smoking_scaled",
+          "age_scaled",
+          "obesity_scaled")])))
+
+
+
+#Fit model
+
+final_model <- S.CARleroux(
+  
+  formula =
+    stillbirths ~
+    IMD_scaled +
+    ethnicity_scaled +
+    smoking_scaled +
+    age_scaled +
+    obesity_scaled +
+    offset(
+      log(births)
+    ),
+  family = "poisson",
+  data =
+    full_model_data,
+  W =
+    full_W,
+  burnin =
+    10000,
+  n.sample =
+    50000,
+  thin =
+    1,
+  n.chains =
+    1,
+  n.cores =
+    1,
+  verbose =
+    TRUE
+)
+
+
+#Posterior coefficients
+
+beta_samples <-
+  final_model$samples$beta
+
+beta_names <- c(
+  "Intercept",
+  "IMD_scaled",
+  "ethnicity_scaled",
+  "smoking_scaled",
+  "age_scaled",
+  "obesity_scaled"
+)
+
+
+colnames(beta_samples) <-
+  beta_names
+
+
+beta_summary <- data.frame(
+  
+  Variable =
+    beta_names,
+  Posterior_Mean =
+    apply(
+      beta_samples,
+      2,
+      mean
+    ),
+  Lower_95_CrI =
+    apply(
+      beta_samples,
+      2,
+      quantile,
+      probs = 0.025
+    ),
+  Upper_95_CrI =
+    apply(
+      beta_samples,
+      2,
+      quantile,
+      probs = 0.975
+    )
+)
+
+
+beta_summary <- beta_summary %>%
+  mutate(
+    
+    Rate_Ratio =
+      exp(
+        Posterior_Mean
+      ),
+    
+    RR_Lower_95_CrI =
+      exp(
+        Lower_95_CrI
+      ),
+    
+    RR_Upper_95_CrI =
+      exp(
+        Upper_95_CrI
+      )
+  )
+
+
+print(beta_summary)
+
+
+#Posterior spatial effects
+
+phi_samples <-
+  final_model$samples$phi
+
+
+#Design matrix
+
+X <- model.matrix(
+  ~
+    IMD_scaled +
+    ethnicity_scaled +
+    smoking_scaled +
+    age_scaled +
+    obesity_scaled,
+  data =
+    full_model_data
+)
+
+
+#Posterior LAD-specific stillbirth rates
+
+n_post <-
+  nrow(beta_samples)
+
+n_lad <-
+  nrow(full_model_data)
+
+
+posterior_rate <- matrix(
+  NA_real_,
+  nrow =
+    n_post,
+  ncol =
+    n_lad
+)
+
+
+for(s in 1:n_post){
+  
+  eta <-
+    X %*%
+    beta_samples[s, ]
+  
+  eta <-
+    as.numeric(eta) +
+    phi_samples[s, ]
+  
+  posterior_rate[s, ] <-
+    exp(eta) *
+    1000
+}
+
+
+#Posterior summary of stillbirth rate
+
+posterior_mean_rate <-
+  apply(
+    posterior_rate,
+    2,
+    mean
+  )
+
+posterior_median_rate <-
+  apply(
+    posterior_rate,
+    2,
+    median
+  )
+
+posterior_lower_rate <-
+  apply(
+    posterior_rate,
+    2,
+    quantile,
+    probs = 0.025
+  )
+
+posterior_upper_rate <-
+  apply(
+    posterior_rate,
+    2,
+    quantile,
+    probs = 0.975
+  )
+
+
+#Posterior hotspot probability
+
+threshold_rate <-
+  3.9
+
+
+posterior_hotspot_probability <-
+  apply(
+    posterior_rate,
+    2,
+    function(x){
+      
+      mean(
+        x > threshold_rate)})
+
+
+#Hotspot results
+
+hotspot_results <- data.frame(
+  
+  LAD24CD =
+    full_model_data$LAD24CD,
+  
+  LAD24NM =
+    full_model_data$LAD24NM,
+  
+  births =
+    full_model_data$births,
+  
+  stillbirths =
+    full_model_data$stillbirths,
+  
+  observed_rate_per_1000 =
+    full_model_data$observed_rate_per_1000,
+  
+  posterior_mean_rate =
+    posterior_mean_rate,
+  
+  posterior_median_rate =
+    posterior_median_rate,
+  
+  posterior_lower_95 =
+    posterior_lower_rate,
+  
+  posterior_upper_95 =
+    posterior_upper_rate,
+  
+  probability_rate_above_3_9 =
+    posterior_hotspot_probability
+)
+
+
+#Hotspot classification
+
+hotspot_results <- hotspot_results %>%
+  mutate(
+    
+    hotspot_probability_category =
+      case_when(
+        
+        probability_rate_above_3_9 >= 0.95
+        ~ "Very high probability",
+        probability_rate_above_3_9 >= 0.80
+        ~ "High probability",
+        probability_rate_above_3_9 >= 0.50
+        ~ "Moderate probability",
+        probability_rate_above_3_9 >= 0.20
+        ~ "Low probability",
+        TRUE
+        ~ "Very low probability"
+        
+      ),
+    
+    hotspot_95 =
+      probability_rate_above_3_9 >=
+      0.95
+    
+  )
+
+
+#Top hotspots
+
+top_hotspots <-
+  hotspot_results %>%
+  arrange(
+    desc(
+      probability_rate_above_3_9
+    )
+  ) %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM,
+    observed_rate_per_1000,
+    posterior_mean_rate,
+    posterior_lower_95,
+    posterior_upper_95,
+    probability_rate_above_3_9
+  )
+
+print(
+  head(
+    top_hotspots,
+    20
+  )
+)
+
+
+#High probability hotspots
+
+cat(
+  "\nHOTSPOT RESULTS\n\n"
+)
+
+cat(
+  "Threshold:",
+  threshold_rate,
+  "per 1,000 births\n"
+)
+
+cat(
+  "Number of LADs:",
+  n_lad,
+  "\n"
+)
+
+cat(
+  "LADs with P(rate > 3.9) >= 0.95:",
+  sum(
+    hotspot_results$hotspot_95
+  ),
+  "\n\n"
+)
+
+
+high_probability_hotspots <-
+  hotspot_results %>%
+  dplyr::filter(
+    hotspot_95
+  ) %>%
+  arrange(
+    desc(
+      probability_rate_above_3_9
+    )
+  )
+
+print(high_probability_hotspots)
+
+
+#Join model results to England spatial data
+
+hotspot_sf <-
+  full_sf %>%
+  left_join(
+    hotspot_results,
+    by = "LAD24CD"
+  )
+
+
+#Download UK LAD shapefile
+
+url <- paste0(
+  "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/",
+  "Local_Authority_Districts_May_2024_Boundaries_UK_BGC/",
+  "FeatureServer/0/query?",
+  "where=1%3D1&outFields=*&f=geojson"
+)
+
+
+lad_uk <- st_read(
+  url,
+  quiet = TRUE
+)
+
+
+#Posterior hotspot probability map
+
+posterior_map_data <-
+  lad_uk %>%
+  left_join(
+    hotspot_results %>%
+      dplyr::select(
+        LAD24CD,
+        probability_rate_above_3_9,
+        posterior_mean_rate,
+        posterior_median_rate,
+        posterior_lower_95,
+        posterior_upper_95
+      ),
+    by = "LAD24CD"
+  )
+
+
+posterior_hotspot_plot <-
+  ggplot(
+    posterior_map_data
+  ) +
+  geom_sf(
+    aes(
+      fill =
+        probability_rate_above_3_9
+    ),
+    colour =
+      "white",
+    linewidth =
+      0.1
+  ) +
+  scale_fill_viridis_c(
+    option =
+      "plasma",
+    limits =
+      c(
+        0,
+        1
+      ),
+    breaks =
+      c(
+        0,
+        0.25,
+        0.50,
+        0.75,
+        0.95,
+        1
+      ),
+    labels =
+      c(
+        "0%",
+        "25%",
+        "50%",
+        "75%",
+        "95%",
+        "100%"
+      ),
+    na.value =
+      "grey90",
+    name =
+      "Posterior probability\nrate > 3.9 per 1,000"
+  ) +
+  labs(
+    title =
+      "Posterior Probability of Stillbirth Rate Exceeding 3.9 per 1,000"
+  ) +
+  theme_void() +
+  theme(
+    plot.title =
+      element_text(
+        face =
+          "bold",
+        size =
+          15
+      ),
+    legend.position =
+      "right",
+    legend.key.height =
+      unit(
+        1.2,
+        "cm"
+      ),
+    legend.key.width =
+      unit(
+        0.6,
+        "cm"
+      ),
+    legend.text =
+      element_text(
+        size =
+          10
+      ),
+    legend.title =
+      element_text(
+        size =
+          10))
+
+
+print(posterior_hotspot_plot)
+
+ggsave(
+  filename =
+    file.path(
+      folder,
+      "FINAL_posterior_hotspot_probability_map_full_model.png"
+    ),
+  plot =
+    posterior_hotspot_plot,
+  width =
+    8,
+  height =
+    10,
+  dpi =
+    300)
+
+
+#Save results
+
+write_xlsx(
+  list(
+    hotspot_results =
+      hotspot_results,
+    coefficient_results =
+      beta_summary,
+    top_hotspots =
+      top_hotspots,
+    high_probability_hotspots =
+      high_probability_hotspots
+  ),
+  file.path(
+    folder,
+    "FINAL_full_model_hotspot_results.xlsx"))
+
+
+
+```
+
+  
+```{r}
+# Find all English LADs missing from the full model
+
+library(dplyr)
+library(stringr)
+
+missing_england_lads <- lad_uk %>%
+  sf::st_drop_geometry() %>%
+  dplyr::filter(
+    stringr::str_detect(LAD24CD, "^E")
+  ) %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM
+  ) %>%
+  dplyr::filter(
+    !LAD24CD %in% full_extension_complete$LAD24CD
+  ) %>%
+  dplyr::arrange(
+    LAD24CD
+  )
+
+cat(
+  "Missing English LADs:",
+  nrow(missing_england_lads),
+  "\n\n")
+
+print(
+  missing_england_lads, row.names = FALSE)
+```
+
+```{r}
+
+library(dplyr)
+library(sf)
+
+#Get LAD codes from shapefile
+
+all_england_LADs <- lad_uk %>%
+  st_drop_geometry() %>%
+  dplyr::filter(
+    grepl("^E", LAD24CD)
+  ) %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM
+  ) %>%
+  dplyr::distinct()
+
+
+#LADs in full dataset
+
+all_data_LADs <- full_extension %>%
+  dplyr::select(
+    LAD24CD
+  ) %>%
+  dplyr::distinct()
+
+
+#LADs missing from dataset
+
+missing_entire_LAD <- all_england_LADs %>%
+  dplyr::anti_join(
+    all_data_LADs,
+    by = "LAD24CD"
+  )
+
+print(
+  missing_entire_LAD)
+
+
+#Check missing risk-factor data
+
+missing_factor_data <- all_england_LADs %>%
+  
+  dplyr::left_join(
+    full_extension,
+    by = c(
+      "LAD24CD",
+      "LAD24NM"
+    )
+  ) %>%
+  
+  dplyr::mutate(
+    Missing_IMD =
+      is.na(IMD_rank),
+    Missing_Ethnicity =
+      is.na(ethnic_minority_pct),
+    Missing_Smoking =
+      is.na(smoking_at_delivery),
+    Missing_Maternal_Age =
+      is.na(maternal_age_35plus),
+    Missing_Obesity =
+      is.na(obesity)
+  ) %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM,
+    Missing_IMD,
+    Missing_Ethnicity,
+    Missing_Smoking,
+    Missing_Maternal_Age,
+    Missing_Obesity
+  )
+
+
+#LADs missing at least one factor
+
+missing_factor_LADs <- missing_factor_data %>%
+  dplyr::filter(
+    Missing_IMD |
+    Missing_Ethnicity |
+    Missing_Smoking |
+    Missing_Maternal_Age |
+    Missing_Obesity
+  )
+
+
+print(missing_factor_LADs)
+
+
+#Save missing data table
+
+write.csv(
+  
+  missing_factor_data,
+  
+  file = file.path(
+    folder,
+    "ALL_England_LAD_missing_data_by_risk_factor.csv"
+  ),
+  
+  row.names = FALSE
+  
+)
+```
+
+
+

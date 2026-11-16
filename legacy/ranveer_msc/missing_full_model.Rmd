@@ -1,0 +1,2316 @@
+```{r}
+
+# ============================================================
+# 0. LIBRARIES AND PROJECT DIRECTORY
+# ============================================================
+
+library(readxl)
+library(dplyr)
+library(sf)
+library(spdep)
+library(CARBayes)
+library(ggplot2)
+library(writexl)
+library(grid)
+library(stringr)
+library(tibble)
+
+if (!requireNamespace("fingertipsR", quietly = TRUE)) {
+  install.packages("fingertipsR")
+}
+
+folder <- "C:/Users/ranve/Documents/Bioinformatics/Individual project"
+
+
+# ============================================================
+# 1. HELPER FUNCTIONS
+# ============================================================
+
+clean <- function(x) {
+  stringr::str_squish(as.character(x))
+}
+
+num <- function(x) {
+  suppressWarnings(as.numeric(gsub(",", "", clean(x))))
+}
+
+# Correct obsolete Barnsley and Sheffield codes if they
+# occur in any of the older datasets.
+
+correct_LAD_codes <- function(x) {
+  x <- trimws(as.character(x))
+
+  x[x == "E08000038"] <- "E08000016"
+  x[x == "E08000039"] <- "E08000019"
+
+  x
+}
+
+
+# ============================================================
+# 2. GET SMOKING DATA
+# ============================================================
+
+smoking_data <- fingertipsR::fingertips_data(
+  IndicatorID = 93085,
+  AreaTypeID = 501
+)
+
+smoking_clean <- smoking_data %>%
+  dplyr::filter(
+    Timeperiod == "2024/25",
+    AreaType == "Districts & UAs (from Apr 2023)"
+  ) %>%
+  dplyr::transmute(
+    LAD24CD = correct_LAD_codes(AreaCode),
+    smoking_at_delivery = num(Value)
+  ) %>%
+  dplyr::distinct(LAD24CD, .keep_all = TRUE)
+
+cat("Smoking LADs:", nrow(smoking_clean), "\n")
+summary(smoking_clean$smoking_at_delivery)
+
+
+# ============================================================
+# 3. GET MATERNAL AGE DATA
+# ============================================================
+
+age_data <- fingertipsR::fingertips_data(
+  IndicatorID = 92250,
+  AreaTypeID = 501
+)
+
+age_clean <- age_data %>%
+  dplyr::filter(
+    Timeperiod == "2024/25",
+    AreaType == "Districts & UAs (from Apr 2023)"
+  ) %>%
+  dplyr::transmute(
+    LAD24CD = correct_LAD_codes(AreaCode),
+    maternal_age_35plus = num(Value)
+  ) %>%
+  dplyr::distinct(LAD24CD, .keep_all = TRUE)
+
+cat("Maternal-age LADs:", nrow(age_clean), "\n")
+summary(age_clean$maternal_age_35plus)
+
+
+# ============================================================
+# 4. GET OBESITY DATA
+# ============================================================
+
+# Indicator 93881 is adult obesity prevalence.
+# It is not a measure of maternal obesity.
+
+obesity_data <- tryCatch(
+  fingertipsR::fingertips_data(
+    IndicatorID = 93881,
+    AreaTypeID = 501
+  ),
+  error = function(e) {
+    message(
+      "\nFingertips obesity API unavailable: ",
+      conditionMessage(e)
+    )
+    NULL
+  }
+)
+
+if (is.null(obesity_data)) {
+
+  message(
+    "Obesity values will be taken from the supplemental Excel file ",
+    "where available. Other missing values will remain NA."
+  )
+
+  obesity_clean <- tibble::tibble(
+    LAD24CD = character(),
+    obesity = numeric()
+  )
+
+} else {
+
+  obesity_clean <- obesity_data %>%
+    dplyr::filter(
+      Timeperiod == "2024/25",
+      AreaType == "Districts & UAs (from Apr 2023)"
+    ) %>%
+    dplyr::transmute(
+      LAD24CD = correct_LAD_codes(AreaCode),
+      obesity = num(Value)
+    ) %>%
+    dplyr::distinct(LAD24CD, .keep_all = TRUE)
+
+  cat("Obesity LADs:", nrow(obesity_clean), "\n")
+  summary(obesity_clean$obesity)
+}
+
+
+# ============================================================
+# 5. CHECK DUPLICATES IN FINGERTIPS DATA
+# ============================================================
+
+check_duplicates <- function(data, dataset_name) {
+
+  duplicates <- data %>%
+    dplyr::count(LAD24CD) %>%
+    dplyr::filter(n > 1)
+
+  if (nrow(duplicates) > 0) {
+
+    cat("\nDuplicates in", dataset_name, ":\n")
+    print(duplicates)
+
+    stop(
+      paste(
+        "Duplicate LAD codes found in",
+        dataset_name
+      )
+    )
+  }
+}
+
+check_duplicates(smoking_clean, "smoking data")
+check_duplicates(age_clean, "maternal age data")
+check_duplicates(obesity_clean, "obesity data")
+
+
+# ============================================================
+# 6. COMBINE EXISTING DATA
+# ============================================================
+
+full_extension <- england_data %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM,
+    births,
+    stillbirths,
+    IMD_rank,
+    ethnic_minority_pct = ethnic_minority_pct.x
+  ) %>%
+  dplyr::mutate(
+    LAD24CD = correct_LAD_codes(LAD24CD)
+  ) %>%
+  dplyr::left_join(
+    smoking_clean,
+    by = "LAD24CD"
+  ) %>%
+  dplyr::left_join(
+    age_clean,
+    by = "LAD24CD"
+  ) %>%
+  dplyr::left_join(
+    obesity_clean,
+    by = "LAD24CD"
+  ) %>%
+  dplyr::filter(
+    stringr::str_detect(LAD24CD, "^E")
+  )
+
+
+# ============================================================
+# 7. READ AND CORRECT THE SUPPLEMENTAL LAD DATA
+# ============================================================
+
+requested_LADs <- readxl::read_excel(
+  file.path(
+    folder,
+    "requested_LADs_all_data.xlsx"
+  )
+)
+
+# Correct the old Barnsley and Sheffield codes.
+
+requested_LADs <- requested_LADs %>%
+  dplyr::mutate(
+    LAD24CD = correct_LAD_codes(LAD24CD),
+
+    LAD24NM = clean(LAD24NM)
+  )
+
+# Standardise Cornwall and Isles of Scilly.
+
+requested_LADs <- requested_LADs %>%
+  dplyr::mutate(
+    LAD24CD = dplyr::if_else(
+      stringr::str_detect(
+        LAD24CD,
+        "E06000052.*E06000053|E06000053.*E06000052"
+      ),
+      "E06000052_E06000053",
+      LAD24CD
+    ),
+
+    maternal_age_35plus = dplyr::if_else(
+      live_births > 0,
+      100 * maternal_age_35plus_count / live_births,
+      NA_real_
+    )
+  )
+
+# Check the corrected codes.
+
+cat("\nCorrected supplemental LAD codes:\n\n")
+
+print(
+  requested_LADs %>%
+    dplyr::filter(
+      LAD24NM %in% c("Barnsley", "Sheffield")
+    ) %>%
+    dplyr::select(LAD24CD, LAD24NM)
+)
+
+# Confirm the expected codes.
+
+if (
+  !all(
+    c("E08000016", "E08000019") %in%
+      requested_LADs$LAD24CD
+  )
+) {
+  stop(
+    "Barnsley or Sheffield is missing from the supplemental dataset."
+  )
+}
+
+
+# ============================================================
+# 8. CONVERT SUPPLEMENTAL DATA INTO MODELLING FORMAT
+# ============================================================
+
+requested_LADs_clean <- requested_LADs %>%
+  dplyr::transmute(
+    LAD24CD,
+    LAD24NM,
+    births = live_births,
+    stillbirths,
+    IMD_rank = mean_lsoa_imd_rank,
+    ethnic_minority_pct,
+    smoking_at_delivery = smoking_at_delivery_value,
+    maternal_age_35plus,
+    obesity = obesity_value
+  )
+
+
+# ============================================================
+# 9. CHECK SUPPLEMENTAL RECORDS FOR DUPLICATES
+# ============================================================
+
+supplement_duplicates <- requested_LADs_clean %>%
+  dplyr::count(LAD24CD) %>%
+  dplyr::filter(n > 1)
+
+if (nrow(supplement_duplicates) > 0) {
+
+  print(supplement_duplicates)
+
+  stop(
+    "Duplicate LAD codes found in the supplemental dataset."
+  )
+}
+
+
+# ============================================================
+# 10. REPLACE EXISTING VERSIONS WITH SUPPLEMENTAL RECORDS
+# ============================================================
+
+full_extension <- full_extension %>%
+  dplyr::filter(
+    !LAD24CD %in% requested_LADs_clean$LAD24CD
+  ) %>%
+  dplyr::bind_rows(
+    requested_LADs_clean
+  ) %>%
+  dplyr::arrange(LAD24CD)
+
+
+cat("\nDATA AFTER ADDING SUPPLEMENTAL LADs\n\n")
+
+cat(
+  "Total LAD records:",
+  nrow(full_extension),
+  "\n"
+)
+
+cat(
+  "Supplemental LAD records:",
+  nrow(requested_LADs_clean),
+  "\n"
+)
+
+
+# ============================================================
+# 11. CHECK DUPLICATE LADs
+# ============================================================
+
+duplicate_LADs <- full_extension %>%
+  dplyr::count(LAD24CD) %>%
+  dplyr::filter(n > 1)
+
+if (nrow(duplicate_LADs) > 0) {
+
+  print(duplicate_LADs)
+
+  stop(
+    "Duplicate LAD codes found after combining datasets."
+  )
+}
+
+
+# ============================================================
+# 12. CHECK MISSING DATA
+# ============================================================
+
+cat("\nMISSING DATA CHECK\n\n")
+
+cat("Total LADs:", nrow(full_extension), "\n")
+
+cat(
+  "Missing births:",
+  sum(is.na(full_extension$births)),
+  "\n"
+)
+
+cat(
+  "Missing stillbirths:",
+  sum(is.na(full_extension$stillbirths)),
+  "\n"
+)
+
+cat(
+  "Missing IMD:",
+  sum(is.na(full_extension$IMD_rank)),
+  "\n"
+)
+
+cat(
+  "Missing ethnicity:",
+  sum(is.na(full_extension$ethnic_minority_pct)),
+  "\n"
+)
+
+cat(
+  "Missing smoking:",
+  sum(is.na(full_extension$smoking_at_delivery)),
+  "\n"
+)
+
+cat(
+  "Missing maternal age:",
+  sum(is.na(full_extension$maternal_age_35plus)),
+  "\n"
+)
+
+cat(
+  "Missing obesity:",
+  sum(is.na(full_extension$obesity)),
+  "\n"
+)
+
+
+missing_full_data <- full_extension %>%
+  dplyr::filter(
+    is.na(births) |
+      is.na(stillbirths) |
+      is.na(IMD_rank) |
+      is.na(ethnic_minority_pct) |
+      is.na(smoking_at_delivery) |
+      is.na(maternal_age_35plus) |
+      is.na(obesity)
+  )
+
+cat(
+  "\nLADs with missing data:",
+  nrow(missing_full_data),
+  "\n"
+)
+
+print(missing_full_data, n = Inf)
+
+
+# ============================================================
+# 13. COMPLETE CASE DATASET
+# ============================================================
+
+full_extension_complete <- full_extension %>%
+  dplyr::filter(
+    !is.na(births),
+    !is.na(stillbirths),
+    !is.na(IMD_rank),
+    !is.na(ethnic_minority_pct),
+    !is.na(smoking_at_delivery),
+    !is.na(maternal_age_35plus),
+    !is.na(obesity),
+    births > 0
+  )
+
+cat(
+  "\nComplete LADs:",
+  nrow(full_extension_complete),
+  "\n"
+)
+
+cat(
+  "Excluded LADs:",
+  nrow(full_extension) -
+    nrow(full_extension_complete),
+  "\n"
+)
+
+# Do not fit the five-predictor model if there are insufficient
+# complete observations.
+
+if (nrow(full_extension_complete) < 2) {
+  stop(
+    paste(
+      "Insufficient complete LAD data to fit the model.",
+      "Obesity values are missing. Obtain the adult obesity",
+      "indicator data from Fingertips or a downloaded CSV",
+      "before proceeding."
+    )
+  )
+}
+
+
+# ============================================================
+# 14. OBSERVED STILLBIRTH RATE
+# ============================================================
+
+full_extension_complete <- full_extension_complete %>%
+  dplyr::mutate(
+    observed_rate_per_1000 =
+      (stillbirths / births) * 1000
+  )
+
+summary(
+  full_extension_complete$observed_rate_per_1000
+)
+
+
+# ============================================================
+# 15. STANDARDISE COVARIATES
+# ============================================================
+
+full_extension_complete <- full_extension_complete %>%
+  dplyr::mutate(
+    IMD_scaled =
+      as.numeric(scale(IMD_rank)),
+
+    ethnicity_scaled =
+      as.numeric(scale(ethnic_minority_pct)),
+
+    smoking_scaled =
+      as.numeric(scale(smoking_at_delivery)),
+
+    age_scaled =
+      as.numeric(scale(maternal_age_35plus)),
+
+    obesity_scaled =
+      as.numeric(scale(obesity))
+  )
+
+print(
+  summary(
+    full_extension_complete[
+      ,
+      c(
+        "IMD_scaled",
+        "ethnicity_scaled",
+        "smoking_scaled",
+        "age_scaled",
+        "obesity_scaled"
+      )
+    ]
+  )
+)
+
+
+# ============================================================
+# 16. DOWNLOAD FULL UK LAD BOUNDARIES
+# ============================================================
+
+cat("\nDownloading full UK LAD boundaries...\n")
+
+url <- paste0(
+  "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/",
+  "Local_Authority_Districts_May_2024_Boundaries_UK_BGC/",
+  "FeatureServer/0/query?",
+  "where=1%3D1&outFields=*&f=geojson"
+)
+
+lad_uk <- sf::st_read(
+  url,
+  quiet = TRUE
+)
+
+# Correct the code format in the spatial data too.
+
+lad_uk <- lad_uk %>%
+  dplyr::mutate(
+    LAD24CD = correct_LAD_codes(LAD24CD)
+  )
+
+cat(
+  "Full UK LADs downloaded:",
+  nrow(lad_uk),
+  "\n"
+)
+
+
+# ============================================================
+# 17. PREPARE ENGLISH SPATIAL DATA
+# ============================================================
+
+england_sf_base <- lad_uk %>%
+  dplyr::filter(
+    stringr::str_detect(LAD24CD, "^E")
+  ) %>%
+  sf::st_make_valid()
+
+
+# Check that Barnsley and Sheffield are in the boundaries.
+
+barnsley_sheffield_check <- england_sf_base %>%
+  sf::st_drop_geometry() %>%
+  dplyr::filter(
+    LAD24CD %in% c("E08000016", "E08000019")
+  ) %>%
+  dplyr::select(LAD24CD, LAD24NM)
+
+print(barnsley_sheffield_check)
+
+if (nrow(barnsley_sheffield_check) != 2) {
+  stop(
+    "Barnsley and Sheffield boundaries were not both found."
+  )
+}
+
+
+# ============================================================
+# 18. DISSOLVE CORNWALL AND ISLES OF SCILLY
+# ============================================================
+
+cornwall_scilly_sf <- england_sf_base %>%
+  dplyr::filter(
+    LAD24CD %in% c(
+      "E06000052",
+      "E06000053"
+    )
+  ) %>%
+  dplyr::summarise(
+    LAD24CD = "E06000052_E06000053",
+    LAD24NM = "Cornwall and Isles of Scilly",
+    do_union = TRUE
+  )
+
+if (nrow(cornwall_scilly_sf) == 0) {
+  stop(
+    "Cornwall and Isles of Scilly polygons were not found in the boundary file."
+  )
+}
+
+england_sf_model <- england_sf_base %>%
+  dplyr::filter(
+    !LAD24CD %in% c(
+      "E06000052",
+      "E06000053"
+    )
+  ) %>%
+  dplyr::bind_rows(
+    cornwall_scilly_sf
+  ) %>%
+  dplyr::arrange(LAD24CD)
+
+
+# ============================================================
+# 19. MATCH SPATIAL DATA TO MODELLING DATA
+# ============================================================
+
+missing_spatial_codes <- full_extension_complete %>%
+  dplyr::anti_join(
+    sf::st_drop_geometry(england_sf_model) %>%
+      dplyr::select(LAD24CD),
+    by = "LAD24CD"
+  )
+
+if (nrow(missing_spatial_codes) > 0) {
+
+  cat("\nLADs without matching spatial boundaries:\n")
+
+  print(
+    missing_spatial_codes %>%
+      dplyr::select(LAD24CD, LAD24NM)
+  )
+
+  stop(
+    "Some modelled LADs do not have matching spatial boundaries."
+  )
+}
+
+full_sf <- england_sf_model %>%
+  dplyr::filter(
+    LAD24CD %in% full_extension_complete$LAD24CD
+  ) %>%
+  dplyr::arrange(
+    match(
+      LAD24CD,
+      full_extension_complete$LAD24CD
+    )
+  )
+
+cat(
+  "\nSpatial LADs:",
+  nrow(full_sf),
+  "\n"
+)
+
+cat(
+  "Data LADs:",
+  nrow(full_extension_complete),
+  "\n"
+)
+
+cat(
+  "Order identical:",
+  identical(
+    full_sf$LAD24CD,
+    full_extension_complete$LAD24CD
+  ),
+  "\n"
+)
+
+if (
+  !identical(
+    full_sf$LAD24CD,
+    full_extension_complete$LAD24CD
+  )
+) {
+  stop(
+    "Spatial and modelling data are not in the same order."
+  )
+}
+
+
+# ============================================================
+# 20. CREATE QUEEN NEIGHBOURS AND HANDLE ISOLATED LADs
+# ============================================================
+
+# Ensure valid geometries
+full_sf <- sf::st_make_valid(full_sf)
+
+# Create Queen-contiguity neighbours
+full_nb <- spdep::poly2nb(
+  full_sf,
+  queen = TRUE
+)
+
+# Convert Queen neighbours into an adjacency matrix
+full_W <- spdep::nb2mat(
+  full_nb,
+  style = "B",
+  zero.policy = TRUE
+)
+
+# Identify isolated LADs
+zero_neighbour_idx <- which(rowSums(full_W) == 0)
+
+cat(
+  "\nLADs with zero Queen-contiguity neighbours:",
+  length(zero_neighbour_idx),
+  "\n"
+)
+
+if (length(zero_neighbour_idx) > 0) {
+
+  print(
+    full_sf[zero_neighbour_idx, ] %>%
+      sf::st_drop_geometry() %>%
+      dplyr::select(LAD24CD, LAD24NM)
+  )
+
+  # Transform to British National Grid for distance calculations
+  full_sf_27700 <- sf::st_transform(full_sf, 27700)
+
+  # Use a point within each polygon to represent its location
+  representative_points <- sf::st_point_on_surface(
+    full_sf_27700
+  )
+
+  coordinates <- sf::st_coordinates(
+    representative_points
+  )
+
+  # Calculate distances between every pair of LADs
+  distance_matrix <- as.matrix(
+    stats::dist(coordinates)
+  )
+
+  # Add a nearest-neighbour link for every isolated LAD
+  for (i in zero_neighbour_idx) {
+
+    # Exclude the LAD itself
+    distance_matrix[i, i] <- Inf
+
+    nearest_idx <- which.min(distance_matrix[i, ])
+
+    # Add a symmetric connection
+    full_W[i, nearest_idx] <- 1
+    full_W[nearest_idx, i] <- 1
+
+    cat(
+      "Connected:",
+      full_sf$LAD24NM[i],
+      "<->",
+      full_sf$LAD24NM[nearest_idx],
+      "| Distance:",
+      round(distance_matrix[i, nearest_idx]),
+      "metres\n"
+    )
+  }
+}
+
+# Assign LAD codes to matrix rows and columns
+rownames(full_W) <- full_sf$LAD24CD
+colnames(full_W) <- full_sf$LAD24CD
+
+# Final validation
+cat("\nADJACENCY MATRIX VALIDATION\n")
+
+cat("Number of LADs:", nrow(full_W), "\n")
+cat("Matrix symmetric:", isSymmetric(full_W), "\n")
+cat("Zero row sums:", sum(rowSums(full_W) == 0), "\n")
+cat("Minimum neighbours:", min(rowSums(full_W)), "\n")
+cat("Maximum neighbours:", max(rowSums(full_W)), "\n")
+
+if (
+  !isSymmetric(full_W) ||
+  any(rowSums(full_W) == 0) ||
+  any(diag(full_W) != 0)
+) {
+  stop("Adjacency matrix validation failed.")
+}
+
+# Confirm matrix order matches modelling data
+if (!identical(
+  rownames(full_W),
+  full_extension_complete$LAD24CD
+)) {
+  stop("Adjacency matrix order does not match modelling data.")
+}
+
+cat("\nAdjacency matrix successfully created.\n")
+
+# ============================================================
+# 21. FINAL MODELLING DATA
+# ============================================================
+
+full_model_data <-
+  as.data.frame(full_extension_complete)
+
+model_variables <- c(
+  "stillbirths",
+  "births",
+  "IMD_scaled",
+  "ethnicity_scaled",
+  "smoking_scaled",
+  "age_scaled",
+  "obesity_scaled"
+)
+
+print(
+  colSums(
+    is.na(
+      full_model_data[, model_variables]
+    )
+  )
+)
+
+cat(
+  "LADs with zero/negative births:",
+  sum(full_model_data$births <= 0),
+  "\n"
+)
+
+if (
+  any(full_model_data$births <= 0) ||
+  anyNA(full_model_data[, model_variables])
+) {
+  stop(
+    "The modelling dataset contains missing values or invalid birth counts."
+  )
+}
+
+
+# ============================================================
+# 22. FIT FINAL FULL MODEL
+# ============================================================
+
+cat("\nFITTING FINAL FULL MODEL\n\n")
+
+final_model <- CARBayes::S.CARleroux(
+  formula =
+    stillbirths ~
+    IMD_scaled +
+    ethnicity_scaled +
+    smoking_scaled +
+    age_scaled +
+    obesity_scaled +
+    offset(log(births)),
+  family = "poisson",
+  data = full_model_data,
+  W = full_W,
+  burnin = 10000,
+  n.sample = 50000,
+  thin = 1,
+  n.chains = 1,
+  n.cores = 1,
+  verbose = TRUE
+)
+
+
+# ============================================================
+# 23. MODEL RESULTS
+# ============================================================
+
+print(final_model)
+print(final_model$summary.results)
+
+cat(
+  "\nDIC:",
+  final_model$modelfit["DIC"],
+  "\n"
+)
+
+cat(
+  "LMPL:",
+  final_model$modelfit["LMPL"],
+  "\n"
+)
+
+
+# ============================================================
+# 24. POSTERIOR COEFFICIENTS
+# ============================================================
+
+beta_samples <- final_model$samples$beta
+
+cat(
+  "Beta posterior dimensions:",
+  dim(beta_samples)[1],
+  "iterations x",
+  dim(beta_samples)[2],
+  "coefficients\n"
+)
+
+beta_names <- c(
+  "Intercept",
+  "IMD_scaled",
+  "ethnicity_scaled",
+  "smoking_scaled",
+  "age_scaled",
+  "obesity_scaled"
+)
+
+if (ncol(beta_samples) != length(beta_names)) {
+  stop(
+    paste0(
+      "Expected ",
+      length(beta_names),
+      " coefficients but found ",
+      ncol(beta_samples),
+      ". Check the model formula."
+    )
+  )
+}
+
+colnames(beta_samples) <- beta_names
+
+beta_summary <- data.frame(
+  Variable = beta_names,
+
+  Posterior_Mean =
+    apply(beta_samples, 2, mean),
+
+  Lower_95_CrI =
+    apply(
+      beta_samples,
+      2,
+      quantile,
+      probs = 0.025
+    ),
+
+  Upper_95_CrI =
+    apply(
+      beta_samples,
+      2,
+      quantile,
+      probs = 0.975
+    )
+) %>%
+  dplyr::mutate(
+    Rate_Ratio = exp(Posterior_Mean),
+    RR_Lower_95_CrI = exp(Lower_95_CrI),
+    RR_Upper_95_CrI = exp(Upper_95_CrI)
+  )
+
+print(beta_summary)
+
+
+# ============================================================
+# 25. POSTERIOR SPATIAL EFFECTS
+# ============================================================
+
+phi_samples <- final_model$samples$phi
+
+cat(
+  "\nPosterior phi dimensions:",
+  dim(phi_samples)[1],
+  "x",
+  dim(phi_samples)[2],
+  "\n"
+)
+
+
+# ============================================================
+# 26. DESIGN MATRIX
+# ============================================================
+
+X <- stats::model.matrix(
+  ~
+    IMD_scaled +
+    ethnicity_scaled +
+    smoking_scaled +
+    age_scaled +
+    obesity_scaled,
+  data = full_model_data
+)
+
+cat(
+  "Design matrix dimensions:",
+  dim(X)[1],
+  "x",
+  dim(X)[2],
+  "\n"
+)
+
+if (ncol(X) != ncol(beta_samples)) {
+  stop(
+    "The design matrix and posterior coefficient dimensions do not match."
+  )
+}
+
+
+# ============================================================
+# 27. POSTERIOR LAD-SPECIFIC STILLBIRTH RATES
+# ============================================================
+
+n_post <- nrow(beta_samples)
+n_lad <- nrow(full_model_data)
+
+if (nrow(phi_samples) != n_post) {
+  stop(
+    "The posterior beta and phi samples have different numbers of iterations."
+  )
+}
+
+if (ncol(phi_samples) != n_lad) {
+  stop(
+    "The number of posterior spatial effects does not match the number of LADs."
+  )
+}
+
+posterior_rate <- matrix(
+  NA_real_,
+  nrow = n_post,
+  ncol = n_lad
+)
+
+for (s in seq_len(n_post)) {
+
+  eta <- as.numeric(
+    X %*% beta_samples[s, ]
+  ) + phi_samples[s, ]
+
+  posterior_rate[s, ] <- exp(eta) * 1000
+}
+
+
+# ============================================================
+# 28. POSTERIOR SUMMARY OF STILLBIRTH RATE
+# ============================================================
+
+posterior_mean_rate <-
+  apply(posterior_rate, 2, mean)
+
+posterior_median_rate <-
+  apply(posterior_rate, 2, median)
+
+posterior_lower_rate <-
+  apply(
+    posterior_rate,
+    2,
+    quantile,
+    probs = 0.025
+  )
+
+posterior_upper_rate <-
+  apply(
+    posterior_rate,
+    2,
+    quantile,
+    probs = 0.975
+  )
+
+
+# ============================================================
+# 29. POSTERIOR HOTSPOT PROBABILITY
+# ============================================================
+
+threshold_rate <- 3.9
+
+posterior_hotspot_probability <-
+  apply(
+    posterior_rate,
+    2,
+    function(x) mean(x > threshold_rate)
+  )
+
+cat(
+  "\nPosterior probability range:",
+  min(posterior_hotspot_probability),
+  "to",
+  max(posterior_hotspot_probability),
+  "\n"
+)
+
+
+# ============================================================
+# 30. FINAL HOTSPOT RESULTS
+# ============================================================
+
+hotspot_results <- data.frame(
+  LAD24CD = full_model_data$LAD24CD,
+  LAD24NM = full_model_data$LAD24NM,
+  births = full_model_data$births,
+  stillbirths = full_model_data$stillbirths,
+  observed_rate_per_1000 = full_model_data$observed_rate_per_1000,
+  posterior_mean_rate = posterior_mean_rate,
+  posterior_median_rate = posterior_median_rate,
+  posterior_lower_95 = posterior_lower_rate,
+  posterior_upper_95 = posterior_upper_rate,
+  probability_rate_above_3_9 = posterior_hotspot_probability
+)
+
+
+# ============================================================
+# 31. HOTSPOT CLASSIFICATION
+# ============================================================
+
+hotspot_results <- hotspot_results %>%
+  dplyr::mutate(
+    hotspot_probability_category =
+      dplyr::case_when(
+        probability_rate_above_3_9 >= 0.95 ~
+          "Very high probability",
+        probability_rate_above_3_9 >= 0.80 ~
+          "High probability",
+        probability_rate_above_3_9 >= 0.50 ~
+          "Moderate probability",
+        probability_rate_above_3_9 >= 0.20 ~
+          "Low probability",
+        TRUE ~
+          "Very low probability"
+      ),
+
+    hotspot_95 =
+      probability_rate_above_3_9 >= 0.95
+  )
+
+
+# ============================================================
+# 32. TOP HOTSPOTS
+# ============================================================
+
+top_hotspots <- hotspot_results %>%
+  dplyr::arrange(
+    dplyr::desc(probability_rate_above_3_9)
+  ) %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM,
+    observed_rate_per_1000,
+    posterior_mean_rate,
+    posterior_lower_95,
+    posterior_upper_95,
+    probability_rate_above_3_9
+  )
+
+print(utils::head(top_hotspots, 20))
+
+
+# ============================================================
+# 33. HIGH-PROBABILITY HOTSPOTS
+# ============================================================
+
+cat("\nHOTSPOT RESULTS\n\n")
+
+cat(
+  "Threshold:",
+  threshold_rate,
+  "per 1,000 births\n"
+)
+
+cat("Number of LADs:", n_lad, "\n")
+
+cat(
+  "LADs with P(rate > 3.9) >= 0.95:",
+  sum(hotspot_results$hotspot_95),
+  "\n\n"
+)
+
+high_probability_hotspots <- hotspot_results %>%
+  dplyr::filter(hotspot_95) %>%
+  dplyr::arrange(
+    dplyr::desc(probability_rate_above_3_9)
+  )
+
+print(high_probability_hotspots)
+
+
+# ============================================================
+# 34. JOIN MODEL RESULTS TO SPATIAL DATA
+# ============================================================
+
+hotspot_sf <- full_sf %>%
+  dplyr::left_join(
+    hotspot_results,
+    by = "LAD24CD"
+  )
+
+
+# ============================================================
+# 35. PREPARE FULL UK MAP BOUNDARIES
+# ============================================================
+
+lad_uk_map <- lad_uk %>%
+  dplyr::filter(
+    !LAD24CD %in% c(
+      "E06000052",
+      "E06000053"
+    )
+  ) %>%
+  dplyr::bind_rows(
+    cornwall_scilly_sf
+  )
+
+cat(
+  "\nFull UK map LADs:",
+  nrow(lad_uk_map),
+  "\n"
+)
+
+
+# ============================================================
+# 36. POSTERIOR HOTSPOT PROBABILITY MAP
+# ============================================================
+
+posterior_map_data <- lad_uk_map %>%
+  dplyr::left_join(
+    hotspot_results %>%
+      dplyr::select(
+        LAD24CD,
+        probability_rate_above_3_9,
+        posterior_mean_rate,
+        posterior_median_rate,
+        posterior_lower_95,
+        posterior_upper_95
+      ),
+    by = "LAD24CD"
+  )
+
+posterior_hotspot_plot <- ggplot2::ggplot(
+  posterior_map_data
+) +
+  ggplot2::geom_sf(
+    ggplot2::aes(
+      fill = probability_rate_above_3_9
+    ),
+    colour = "white",
+    linewidth = 0.1
+  ) +
+  ggplot2::scale_fill_viridis_c(
+    option = "plasma",
+    limits = c(0, 1),
+    breaks = c(0, 0.25, 0.50, 0.75, 0.95, 1),
+    labels = c("0%", "25%", "50%", "75%", "95%", "100%"),
+    na.value = "grey90",
+    name = "Posterior probability\nrate > 3.9 per 1,000"
+  ) +
+  ggplot2::labs(
+    title = "Posterior Probability of Stillbirth Rate Exceeding 3.9 per 1,000"
+  ) +
+  ggplot2::theme_void() +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold",
+      size = 15
+    ),
+    legend.position = "right",
+    legend.key.height = grid::unit(1.2, "cm"),
+    legend.key.width = grid::unit(0.6, "cm"),
+    legend.text = ggplot2::element_text(size = 10),
+    legend.title = ggplot2::element_text(size = 10)
+  )
+
+print(posterior_hotspot_plot)
+
+
+# ============================================================
+# 37. SAVE POSTERIOR HOTSPOT PROBABILITY MAP
+# ============================================================
+
+ggplot2::ggsave(
+  filename = file.path(
+    folder,
+    "FINAL_posterior_hotspot_probability_map_full_model.png"
+  ),
+  plot = posterior_hotspot_plot,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+
+# ============================================================
+# 38. BINARY 95% HOTSPOT MAP
+# ============================================================
+
+hotspot_map_data <- lad_uk_map %>%
+  dplyr::left_join(
+    hotspot_results %>%
+      dplyr::select(
+        LAD24CD,
+        hotspot_95
+      ),
+    by = "LAD24CD"
+  )
+
+binary_hotspot_map <- ggplot2::ggplot(
+  hotspot_map_data
+) +
+  ggplot2::geom_sf(
+    ggplot2::aes(fill = hotspot_95),
+    colour = "grey40",
+    linewidth = 0.15
+  ) +
+  ggplot2::scale_fill_manual(
+    values = c(
+      "FALSE" = "grey90",
+      "TRUE" = "red"
+    ),
+    na.value = "grey90",
+    labels = c(
+      "FALSE" = "P(rate > 3.9) < 0.95",
+      "TRUE" = "P(rate > 3.9) >= 0.95"
+    ),
+    name = "Hotspot"
+  ) +
+  ggplot2::labs(
+    title = "Posterior Probability Hotspots for Stillbirth Risk"
+  ) +
+  ggplot2::theme_void() +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      size = 16,
+      face = "bold"
+    ),
+    legend.position = "right",
+    legend.key.height = grid::unit(1.2, "cm"),
+    legend.text = ggplot2::element_text(size = 10),
+    legend.title = ggplot2::element_text(size = 10)
+  )
+
+print(binary_hotspot_map)
+
+
+# ============================================================
+# 39. SAVE BINARY HOTSPOT MAP
+# ============================================================
+
+ggplot2::ggsave(
+  filename = file.path(
+    folder,
+    "FINAL_binary_hotspot_map_full_model_95percent.png"
+  ),
+  plot = binary_hotspot_map,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+
+# ============================================================
+# 40. SAVE ALL RESULTS
+# ============================================================
+
+writexl::write_xlsx(
+  list(
+    hotspot_results = hotspot_results,
+    coefficient_results = beta_summary,
+    top_hotspots = top_hotspots,
+    high_probability_hotspots = high_probability_hotspots,
+    complete_model_data = full_extension_complete,
+    missing_data = missing_full_data
+  ),
+  file.path(
+    folder,
+    "FINAL_full_model_hotspot_results.xlsx"
+  )
+)
+
+
+# ============================================================
+# 41. FINAL SUMMARY
+# ============================================================
+
+cat("\nFINAL FULL MODEL\n\n")
+
+cat(
+  "Model:",
+  "IMD + ethnicity + smoking + maternal age + obesity",
+  "\n"
+)
+
+cat("LADs:", n_lad, "\n")
+
+cat(
+  "DIC:",
+  round(final_model$modelfit["DIC"], 3),
+  "\n"
+)
+
+cat(
+  "LMPL:",
+  round(final_model$modelfit["LMPL"], 3),
+  "\n"
+)
+
+cat(
+  "Threshold:",
+  threshold_rate,
+  "per 1,000 births\n"
+)
+
+cat(
+  "High-probability hotspots:",
+  sum(hotspot_results$hotspot_95),
+  "\n\n"
+)
+
+cat("Top 10 LADs:\n\n")
+
+print(utils::head(top_hotspots, 10))
+
+cat("\nFILES SAVED\n\n")
+
+cat(
+  "Posterior probability map:\n",
+  file.path(
+    folder,
+    "FINAL_posterior_hotspot_probability_map_full_model.png"
+  ),
+  "\n\n"
+)
+
+cat(
+  "Binary 95% hotspot map:\n",
+  file.path(
+    folder,
+    "FINAL_binary_hotspot_map_full_model_95percent.png"
+  ),
+  "\n\n"
+)
+
+cat(
+  "Excel results:\n",
+  file.path(
+    folder,
+    "FINAL_full_model_hotspot_results.xlsx"
+  ),
+  "\n"
+)
+
+
+# ============================================================
+# 42. DISPLAY 95% HOTSPOTS AS A TABLE
+# ============================================================
+
+hotspots_95_table <- hotspot_results %>%
+  dplyr::filter(hotspot_95 == TRUE) %>%
+  dplyr::arrange(
+    dplyr::desc(probability_rate_above_3_9)
+  ) %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM,
+    observed_rate_per_1000,
+    posterior_mean_rate,
+    posterior_lower_95,
+    posterior_upper_95,
+    probability_rate_above_3_9
+  )
+
+print(as.data.frame(hotspots_95_table), row.names = FALSE)
+
+
+# ============================================================
+# 43. FIND ENGLISH LADs MISSING FROM THE MODEL
+# ============================================================
+
+missing_england_lads <- lad_uk_map %>%
+  sf::st_drop_geometry() %>%
+  dplyr::filter(
+    stringr::str_detect(LAD24CD, "^E")
+  ) %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM
+  ) %>%
+  dplyr::filter(
+    !LAD24CD %in% full_extension_complete$LAD24CD
+  ) %>%
+  dplyr::arrange(LAD24CD)
+
+cat(
+  "\nEnglish LADs missing from the model:",
+  nrow(missing_england_lads),
+  "\n\n"
+)
+
+print(missing_england_lads, n = Inf)
+
+
+# ============================================================
+# 44. CHECK ALL ENGLISH LADs AND MISSING RISK FACTORS
+# ============================================================
+
+all_england_LADs <- lad_uk_map %>%
+  sf::st_drop_geometry() %>%
+  dplyr::filter(
+    stringr::str_detect(LAD24CD, "^E")
+  ) %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM
+  ) %>%
+  dplyr::distinct()
+
+all_data_LADs <- full_extension %>%
+  dplyr::select(LAD24CD) %>%
+  dplyr::distinct()
+
+missing_entire_LAD <- all_england_LADs %>%
+  dplyr::anti_join(
+    all_data_LADs,
+    by = "LAD24CD"
+  )
+
+cat(
+  "\nLADs completely missing from the full dataset:",
+  nrow(missing_entire_LAD),
+  "\n\n"
+)
+
+print(missing_entire_LAD, n = Inf)
+
+
+# Check every English LAD for missing risk-factor data.
+
+missing_factor_data <- all_england_LADs %>%
+  dplyr::left_join(
+    full_extension,
+    by = c("LAD24CD", "LAD24NM")
+  ) %>%
+  dplyr::mutate(
+    Missing_IMD = is.na(IMD_rank),
+    Missing_Ethnicity = is.na(ethnic_minority_pct),
+    Missing_Smoking = is.na(smoking_at_delivery),
+    Missing_Maternal_Age = is.na(maternal_age_35plus),
+    Missing_Obesity = is.na(obesity)
+  ) %>%
+  dplyr::select(
+    LAD24CD,
+    LAD24NM,
+    Missing_IMD,
+    Missing_Ethnicity,
+    Missing_Smoking,
+    Missing_Maternal_Age,
+    Missing_Obesity
+  )
+
+missing_factor_LADs <- missing_factor_data %>%
+  dplyr::filter(
+    Missing_IMD |
+      Missing_Ethnicity |
+      Missing_Smoking |
+      Missing_Maternal_Age |
+      Missing_Obesity
+  )
+
+cat(
+  "\nLADs missing at least one risk factor:",
+  nrow(missing_factor_LADs),
+  "\n\n"
+)
+
+View(missing_factor_LADs)
+
+
+# ============================================================
+# 45. MISSING DATA COUNTS
+# ============================================================
+
+cat("\nMISSING DATA BY RISK FACTOR\n\n")
+
+cat(
+  "IMD:",
+  sum(missing_factor_data$Missing_IMD),
+  "\n"
+)
+
+cat(
+  "Ethnicity:",
+  sum(missing_factor_data$Missing_Ethnicity),
+  "\n"
+)
+
+cat(
+  "Smoking:",
+  sum(missing_factor_data$Missing_Smoking),
+  "\n"
+)
+
+cat(
+  "Maternal age:",
+  sum(missing_factor_data$Missing_Maternal_Age),
+  "\n"
+)
+
+cat(
+  "Obesity:",
+  sum(missing_factor_data$Missing_Obesity),
+  "\n"
+)
+
+complete_all_factors <- missing_factor_data %>%
+  dplyr::filter(
+    !Missing_IMD,
+    !Missing_Ethnicity,
+    !Missing_Smoking,
+    !Missing_Maternal_Age,
+    !Missing_Obesity
+  )
+
+cat(
+  "\nEnglish LADs complete for all five factors:",
+  nrow(complete_all_factors),
+  "\n"
+)
+
+cat(
+  "English LADs missing at least one factor:",
+  nrow(missing_factor_LADs),
+  "\n"
+)
+
+
+# Save the missing-data table.
+
+utils::write.csv(
+  missing_factor_data,
+  file = file.path(
+    folder,
+    "ALL_England_LAD_missing_data_by_risk_factor.csv"
+  ),
+  row.names = FALSE
+)
+
+```
+
+```{r}
+# ============================================================
+# 46. EXPLANATORY VARIABLE MAPS
+# ============================================================
+
+# Prepare map dataset using the same LAD boundaries as the
+# posterior hotspot probability map.
+
+lad_data <- lad_uk_map %>%
+  dplyr::left_join(
+    full_extension_complete %>%
+      dplyr::select(
+        LAD24CD,
+        stillbirth_rate_per_1000 = observed_rate_per_1000,
+        IMD_rank,
+        ethnic_minority_pct
+      ),
+    by = "LAD24CD"
+  )
+
+
+# ============================================================
+# 46A. STILLBIRTH RATE MAP
+# ============================================================
+
+stillbirth_plot <- ggplot2::ggplot(lad_data) +
+  ggplot2::geom_sf(
+    ggplot2::aes(fill = stillbirth_rate_per_1000),
+    colour = "white",
+    linewidth = 0.1
+  ) +
+  ggplot2::scale_fill_viridis_c(
+    option = "plasma",
+    na.value = "grey95",
+    name = "Stillbirths\nper 1,000"
+  ) +
+  ggplot2::theme_void() +
+  ggplot2::labs(
+    title = "Stillbirth Rate by Local Authority District"
+  ) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold",
+      size = 15
+    ),
+    legend.position = "right"
+  )
+
+print(stillbirth_plot)
+
+ggplot2::ggsave(
+  file.path(folder, "stillbirth_rate_map.png"),
+  stillbirth_plot,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+
+# ============================================================
+# 46B. INDEX OF MULTIPLE DEPRIVATION MAP
+# ============================================================
+
+imd_plot <- ggplot2::ggplot(lad_data) +
+  ggplot2::geom_sf(
+    ggplot2::aes(fill = IMD_rank),
+    colour = "white",
+    linewidth = 0.1
+  ) +
+  ggplot2::scale_fill_viridis_c(
+    option = "magma",
+    direction = -1,
+    na.value = "grey95",
+    name = "Mean LAD-level\nIMD Rank"
+  ) +
+  ggplot2::theme_void() +
+  ggplot2::labs(
+    title = "Index of Multiple Deprivation by Local Authority District"
+  ) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold",
+      size = 15
+    ),
+    legend.position = "right"
+  )
+
+print(imd_plot)
+
+ggplot2::ggsave(
+  file.path(folder, "imd_map.png"),
+  imd_plot,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+
+# ============================================================
+# 46C. ETHNIC MINORITY POPULATION MAP
+# ============================================================
+
+ethnicity_plot <- ggplot2::ggplot(lad_data) +
+  ggplot2::geom_sf(
+    ggplot2::aes(fill = ethnic_minority_pct),
+    colour = "white",
+    linewidth = 0.1
+  ) +
+  ggplot2::scale_fill_viridis_c(
+    option = "cividis",
+    na.value = "grey95",
+    name = "Ethnic Minority\nPopulation (%)"
+  ) +
+  ggplot2::theme_void() +
+  ggplot2::labs(
+    title = "Ethnic Minority Population by Local Authority District"
+  ) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold",
+      size = 15
+    ),
+    legend.position = "right"
+  )
+
+print(ethnicity_plot)
+
+ggplot2::ggsave(
+  file.path(folder, "ethnic_minority_map.png"),
+  ethnicity_plot,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+
+# ============================================================
+# 46D. CHECK MAP DATA COVERAGE
+# ============================================================
+
+cat("\nEXPLANATORY MAP DATA COVERAGE\n\n")
+
+cat(
+  "English LADs with stillbirth rates:",
+  sum(
+    !is.na(lad_data$stillbirth_rate_per_1000) &
+      stringr::str_detect(lad_data$LAD24CD, "^E")
+  ),
+  "\n"
+)
+
+cat(
+  "English LADs with IMD data:",
+  sum(
+    !is.na(lad_data$IMD_rank) &
+      stringr::str_detect(lad_data$LAD24CD, "^E")
+  ),
+  "\n"
+)
+
+cat(
+  "English LADs with ethnicity data:",
+  sum(
+    !is.na(lad_data$ethnic_minority_pct) &
+      stringr::str_detect(lad_data$LAD24CD, "^E")
+  ),
+  "\n"
+)
+
+cat(
+  "\nMaps saved to:\n",
+  folder,
+  "\n"
+)
+```
+
+```{r}
+# ============================================================
+# 32. LEAVE-ONE-OUT CROSS-VALIDATION (LOOCV)
+# ============================================================
+
+library(CARBayes)
+library(spdep)
+library(sf)
+library(writexl)
+
+
+# ------------------------------------------------------------
+# 1. CHECK DATA AND SPATIAL ORDER
+# ------------------------------------------------------------
+
+n <- nrow(full_model_data)
+
+stopifnot(
+  nrow(full_sf) == n,
+  identical(
+    full_sf$LAD24CD,
+    full_model_data$LAD24CD
+  )
+)
+
+observed <- full_model_data$stillbirths
+
+predicted <- numeric(n)
+
+
+# ------------------------------------------------------------
+# 2. CREATE THE FULL SPATIAL WEIGHTS MATRIX
+# ------------------------------------------------------------
+
+# Use Queen contiguity, matching the final model.
+
+nb_full_loocv <- spdep::poly2nb(
+  full_sf,
+  queen = TRUE
+)
+
+W_full_loocv <- spdep::nb2mat(
+  nb_full_loocv,
+  style = "B",
+  zero.policy = TRUE
+)
+
+
+# Add nearest-neighbour links for originally isolated LADs.
+
+zero_idx <- which(
+  rowSums(W_full_loocv) == 0
+)
+
+if(length(zero_idx) > 0){
+
+  full_points <- sf::st_point_on_surface(
+    sf::st_transform(full_sf, 27700)
+  )
+
+  distance_matrix <- as.matrix(
+    stats::dist(
+      sf::st_coordinates(full_points)
+    )
+  )
+
+  for(j in zero_idx){
+
+    distance_matrix[j, j] <- Inf
+
+    nearest <- which.min(
+      distance_matrix[j, ]
+    )
+
+    W_full_loocv[j, nearest] <- 1
+    W_full_loocv[nearest, j] <- 1
+
+  }
+
+}
+
+
+# Ensure symmetric binary weights.
+
+W_full_loocv <- ifelse(
+  (W_full_loocv + t(W_full_loocv)) > 0,
+  1,
+  0
+)
+
+diag(W_full_loocv) <- 0
+
+stopifnot(
+  isSymmetric(W_full_loocv),
+  all(rowSums(W_full_loocv) > 0)
+)
+
+
+# ------------------------------------------------------------
+# 3. SET UP CROSS-VALIDATION
+# ------------------------------------------------------------
+
+set.seed(123)
+
+for(i in 1:n){
+
+  message(
+    "Running LAD ",
+    i,
+    " of ",
+    n
+  )
+
+
+  # Remove the held-out LAD.
+
+  train_data <- full_model_data[-i, ]
+
+  train_sf <- full_sf[-i, ]
+
+
+  # ----------------------------------------------------------
+  # 4. STANDARDISE USING TRAINING DATA ONLY
+  # ----------------------------------------------------------
+
+  predictors <- c(
+    "IMD_rank",
+    "ethnic_minority_pct",
+    "smoking_at_delivery",
+    "maternal_age_35plus",
+    "obesity"
+  )
+
+  scaled_names <- c(
+    "IMD_scaled",
+    "ethnicity_scaled",
+    "smoking_scaled",
+    "age_scaled",
+    "obesity_scaled"
+  )
+
+
+  test_data <- full_model_data[i, ]
+
+
+  for(j in seq_along(predictors)){
+
+    variable <- predictors[j]
+    scaled_variable <- scaled_names[j]
+
+    training_mean <- mean(
+      train_data[[variable]]
+    )
+
+    training_sd <- sd(
+      train_data[[variable]]
+    )
+
+    if(
+      !is.finite(training_sd) ||
+      training_sd == 0
+    ){
+      stop(
+        paste(
+          "Invalid standard deviation for",
+          variable,
+          "in fold",
+          i
+        )
+      )
+    }
+
+    train_data[[scaled_variable]] <-
+      (
+        train_data[[variable]] -
+          training_mean
+      ) / training_sd
+
+    test_data[[scaled_variable]] <-
+      (
+        test_data[[variable]] -
+          training_mean
+      ) / training_sd
+
+  }
+
+
+  # ----------------------------------------------------------
+  # 5. CREATE TRAINING SPATIAL WEIGHTS
+  # ----------------------------------------------------------
+
+  W_train <- W_full_loocv[
+    -i,
+    -i,
+    drop = FALSE
+  ]
+
+
+  # Removing a LAD can leave some training LADs isolated.
+  # Add nearest-neighbour links where necessary.
+
+  zero_train_idx <- which(
+    rowSums(W_train) == 0
+  )
+
+  if(length(zero_train_idx) > 0){
+
+    train_points <- sf::st_point_on_surface(
+      sf::st_transform(train_sf, 27700)
+    )
+
+    train_distances <- as.matrix(
+      stats::dist(
+        sf::st_coordinates(train_points)
+      )
+    )
+
+    for(j in zero_train_idx){
+
+      train_distances[j, j] <- Inf
+
+      nearest <- which.min(
+        train_distances[j, ]
+      )
+
+      W_train[j, nearest] <- 1
+      W_train[nearest, j] <- 1
+
+    }
+
+  }
+
+
+  W_train <- ifelse(
+    (W_train + t(W_train)) > 0,
+    1,
+    0
+  )
+
+  diag(W_train) <- 0
+
+  stopifnot(
+    isSymmetric(W_train),
+    all(rowSums(W_train) > 0),
+    nrow(W_train) == nrow(train_data)
+  )
+
+
+  # ----------------------------------------------------------
+  # 6. FIT THE FIVE-PREDICTOR CAR LEROUX MODEL
+  # ----------------------------------------------------------
+
+  model <- CARBayes::S.CARleroux(
+
+    formula =
+      stillbirths ~
+      IMD_scaled +
+      ethnicity_scaled +
+      smoking_scaled +
+      age_scaled +
+      obesity_scaled +
+      offset(log(births)),
+
+    family = "poisson",
+
+    data = train_data,
+
+    W = W_train,
+
+    burnin = 10000,
+
+    n.sample = 50000,
+
+    thin = 1,
+
+    n.chains = 1,
+
+    n.cores = 1,
+
+    verbose = FALSE
+
+  )
+
+
+  # ----------------------------------------------------------
+  # 7. EXTRACT POSTERIOR SAMPLES
+  # ----------------------------------------------------------
+
+  beta_draws <- model$samples$beta
+  phi_draws <- model$samples$phi
+  rho_draws <- as.numeric(model$samples$rho)
+  tau2_draws <- as.numeric(model$samples$tau2)
+
+
+  if(
+    ncol(beta_draws) != 6 ||
+    ncol(phi_draws) != nrow(train_data) ||
+    nrow(beta_draws) != nrow(phi_draws) ||
+    length(rho_draws) != nrow(beta_draws) ||
+    length(tau2_draws) != nrow(beta_draws)
+  ){
+
+    stop(
+      paste(
+        "Posterior sample dimensions do not match in fold",
+        i
+      )
+    )
+
+  }
+
+
+  # ----------------------------------------------------------
+  # 8. FIXED-EFFECT PREDICTION FOR HELD-OUT LAD
+  # ----------------------------------------------------------
+
+  x_test <- c(
+    1,
+    test_data$IMD_scaled,
+    test_data$ethnicity_scaled,
+    test_data$smoking_scaled,
+    test_data$age_scaled,
+    test_data$obesity_scaled
+  )
+
+  eta_fixed <- as.numeric(
+    beta_draws %*% x_test
+  ) + log(test_data$births)
+
+
+  # ----------------------------------------------------------
+  # 9. PREDICT THE HELD-OUT SPATIAL EFFECT
+  # ----------------------------------------------------------
+
+  # Obtain the held-out LAD's connections to the training LADs.
+
+  w_heldout <- W_full_loocv[
+    i,
+    -i
+  ]
+
+  # If it has no remaining training neighbours,
+  # connect it to its nearest training LAD.
+
+  if(sum(w_heldout) == 0){
+
+    full_points <- sf::st_point_on_surface(
+      sf::st_transform(full_sf, 27700)
+    )
+
+    heldout_coordinates <- sf::st_coordinates(
+      full_points[i, ]
+    )
+
+    training_coordinates <- sf::st_coordinates(
+      full_points[-i, ]
+    )
+
+    distances <- sqrt(
+      rowSums(
+        (
+          training_coordinates -
+            matrix(
+              heldout_coordinates,
+              nrow = nrow(training_coordinates),
+              ncol = 2,
+              byrow = TRUE
+            )
+        )^2
+      )
+    )
+
+    nearest <- which.min(distances)
+
+    w_heldout[nearest] <- 1
+
+  }
+
+
+  # Conditional CAR Leroux spatial-effect prediction:
+  #
+  # E(phi_i | phi_-i) =
+  # rho * sum(w_ij * phi_j) /
+  # (1 - rho + rho * sum(w_ij))
+  #
+  # Conditional variance =
+  # tau2 / (1 - rho + rho * sum(w_ij))
+
+  heldout_degree <- sum(w_heldout)
+
+  spatial_mean <- numeric(nrow(phi_draws))
+  spatial_variance <- numeric(nrow(phi_draws))
+
+  for(s in 1:nrow(phi_draws)){
+
+    denominator <-
+      1 - rho_draws[s] +
+      rho_draws[s] * heldout_degree
+
+    spatial_mean[s] <-
+      rho_draws[s] *
+      sum(
+        w_heldout * phi_draws[s, ]
+      ) / denominator
+
+    spatial_variance[s] <-
+      tau2_draws[s] / denominator
+
+  }
+
+
+  # ----------------------------------------------------------
+  # 10. PREDICT EXPECTED STILLBIRTH COUNT
+  # ----------------------------------------------------------
+
+  # Integrate over the conditional distribution of the
+  # held-out spatial effect using the log-normal expectation.
+
+  predicted_draws <- exp(
+    eta_fixed +
+      spatial_mean +
+      0.5 * spatial_variance
+  )
+
+  predicted[i] <- mean(predicted_draws)
+
+
+}
+
+
+# ============================================================
+# 11. CROSS-VALIDATION PERFORMANCE
+# ============================================================
+
+rmse <- sqrt(
+  mean(
+    (observed - predicted)^2
+  )
+)
+
+mae <- mean(
+  abs(
+    observed - predicted
+  )
+)
+
+bias <- mean(
+  predicted - observed
+)
+
+
+# ============================================================
+# 12. RESULTS
+# ============================================================
+
+results <- data.frame(
+
+  LAD = full_model_data$LAD24CD,
+
+  LAD_name = full_model_data$LAD24NM,
+
+  observed = observed,
+
+  predicted = predicted,
+
+  error = predicted - observed
+
+)
+
+
+print(rmse)
+print(mae)
+print(bias)
+
+
+# ============================================================
+# 13. EXPORT RESULTS
+# ============================================================
+
+write_xlsx(
+
+  list(
+
+    predictions = results,
+
+    validation = data.frame(
+      RMSE = rmse,
+      MAE = mae,
+      Bias = bias
+    )
+
+  ),
+
+  file.path(
+    folder,
+    "LOOCV_full_model.xlsx"
+  )
+
+)
+```
+

@@ -1,0 +1,6 @@
+^data-raw$
+^analysis$
+^output$
+^legacy$
+^README\.md$
+^\.gitignore$

@@ -1,0 +1,206 @@
+log(λi)=β0+Si
+Yi∼Poisson(birthsiλi)
+
+```{r}
+library(CARBayes)
+library(sf)
+library(spdep)
+library(dplyr)
+library(writexl)
+library(stringr)
+library(ggplot2)
+
+lad_model <- lad_data %>%
+  left_join(final, by = c("LAD24CD" = "area_code"))
+
+lad_model <- lad_model %>%
+  rename(
+    stillbirths = stillbirths.x,
+    births = births.x
+  )
+
+# England model data
+england_sf <- lad_model %>%
+  filter(
+    !is.na(stillbirths),
+    !is.na(births),
+    births > 0,
+    str_detect(LAD24CD, "^E")
+  )
+
+england_sf <- england_sf[card(poly2nb(england_sf, queen = TRUE)) > 0, ]
+
+england_data <- england_sf %>%
+  st_drop_geometry()
+
+england_nb <- poly2nb(england_sf, queen = TRUE)
+
+england_W <- listw2mat(nb2listw(england_nb, style = "B"))
+england_W <- (england_W + t(england_W)) / 2
+england_W <- ifelse(england_W > 0, 1, 0)
+
+england_model_null <- S.CARleroux(
+  formula = stillbirths ~ offset(log(births)),
+  family = "poisson",
+  data = england_data,
+  W = england_W,
+  burnin = 10000,
+  n.sample = 50000
+)
+
+# Regression coefficients
+results <- england_model_null$summary.results %>%
+  as.data.frame() %>%
+  mutate(
+    parameter = rownames(.),
+    model = "England (Null model)"
+  )
+
+# Spatial correlation
+spatial_results <- data.frame(
+  model = "England (Null model)",
+  spatial_correlation = england_model_null$summary.results["rho", "Mean"]
+)
+
+# Unexplained spatial variance
+variance_results <- data.frame(
+  model = "England (Null model)",
+  unexplained_variance = var(as.vector(england_model_null$samples$phi))
+)
+
+CARBayes_results <- list(
+  regression_coefficients = results,
+  spatial_correlation = spatial_results,
+  unexplained_variance = variance_results
+)
+
+write_xlsx(
+  CARBayes_results,
+  file.path(folder, "CARBayes_null_model_results.xlsx")
+)
+
+# Predicted stillbirth counts
+england_data$predicted_stillbirths <- england_model_null$fitted.values
+
+# Observed vs predicted plot
+observed_predicted_plot <- ggplot(
+  england_data,
+  aes(x = predicted_stillbirths, y = stillbirths)
+) +
+  geom_point(colour = "steelblue", alpha = 0.7, size = 2) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    colour = "red",
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Observed vs Predicted Stillbirth Counts (Null Spatial Model)",
+    x = "Predicted stillbirths",
+    y = "Observed stillbirths"
+  ) +
+  theme_minimal()
+
+ggsave(
+  file.path(folder, "observed_vs_predicted_null_model.png"),
+  observed_predicted_plot,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+observed_predicted_plot
+```
+
+```{r}
+library(CARBayes)
+library(spdep)
+library(writexl)
+
+n <- nrow(england_sf)
+
+observed <- england_data$stillbirths
+predicted <- numeric(n)
+
+for(i in 1:n){
+
+  # Remove left-out LAD
+  train_sf <- england_sf[-i, ]
+  train_data <- england_data[-i, ]
+
+  # Create neighbours
+  nb_train <- poly2nb(train_sf, queen = TRUE)
+
+  # Remove isolated areas
+  keep <- card(nb_train) > 0
+
+  train_sf <- train_sf[keep, ]
+  train_data <- train_data[keep, ]
+
+  # Recalculate neighbours
+  nb_train <- poly2nb(train_sf, queen = TRUE)
+
+  # Spatial weights
+  W_train <- listw2mat(
+    nb2listw(
+      nb_train,
+      style = "B",
+      zero.policy = TRUE
+    )
+  )
+
+  W_train <- (W_train + t(W_train)) / 2
+  W_train <- ifelse(W_train > 0, 1, 0)
+
+  # Fit null spatial model
+  model <- S.CARleroux(
+    formula =
+      stillbirths ~
+      offset(log(births)),
+    family = "poisson",
+    data = train_data,
+    W = W_train,
+    burnin = 10000,
+    n.sample = 50000
+  )
+
+  # Posterior mean intercept
+  beta_mean <- mean(model$samples$beta[,1])
+
+  # Predict excluded LAD
+  eta <-
+    beta_mean +
+    log(england_data$births[i])
+
+  predicted[i] <- exp(eta)
+
+}
+
+# Performance metrics
+
+rmse <- sqrt(mean((observed - predicted)^2))
+
+bias <- mean(predicted - observed)
+
+results <- data.frame(
+  LAD = england_data$LAD24CD,
+  observed = observed,
+  predicted = predicted,
+  error = predicted - observed
+)
+
+print(rmse)
+print(bias)
+
+write_xlsx(
+  list(
+    predictions = results,
+    validation = data.frame(
+      RMSE = rmse,
+      Bias = bias
+    )
+  ),
+  file.path(folder, "LOOCV_null_model.xlsx")
+)
+```
+

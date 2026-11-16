@@ -1,0 +1,372 @@
+```{r}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(tibble)
+library(writexl)
+install.packages("fingertipsR")
+
+project_dir <- "C:/Users/ranve/Documents/Bioinformatics/Individual project"
+
+clean <- function(x) {
+  stringr::str_squish(as.character(x))
+}
+
+num <- function(x) {
+  suppressWarnings(as.numeric(gsub(",", "", clean(x))))
+}
+
+targets <- tibble::tribble(
+  ~LAD24CD,               ~LAD24NM,
+  "E06000027",            "Torbay",
+  "E06000046",            "Isle of Wight",
+  "E06000052, E06000053", "Cornwall and Isles of Scilly",
+  "E06000063",            "Cumberland",
+  "E06000064",            "Westmorland and Furness",
+  "E06000065",            "North Yorkshire",
+  "E06000066",            "Somerset",
+  "E08000016",            "Barnsley",
+  "E08000019",            "Sheffield",
+  "E09000001",            "City of London"
+)
+
+code_map <- c(
+  "E06000027" = "E06000027",
+  "E06000046" = "E06000046",
+  "E06000052" = "E06000052, E06000053",
+  "E06000053" = "E06000052, E06000053",
+  "E06000063" = "E06000063",
+  "E06000064" = "E06000064",
+  "E06000065" = "E06000065",
+  "E06000066" = "E06000066",
+  "E08000016" = "E08000016",
+  "E08000019" = "E08000019",
+  "E09000001" = "E09000001"
+)
+
+name_map <- c(
+  "torbay" = "E06000027",
+  "isle of wight" = "E06000046",
+  "cornwall" = "E06000052, E06000053",
+  "isles of scilly" = "E06000052, E06000053",
+  "cornwall and isles of scilly" = "E06000052, E06000053",
+  "cumberland" = "E06000063",
+  "allerdale" = "E06000063",
+  "carlisle" = "E06000063",
+  "copeland" = "E06000063",
+  "westmorland and furness" = "E06000064",
+  "barrow in furness" = "E06000064",
+  "barrow-in-furness" = "E06000064",
+  "eden" = "E06000064",
+  "south lakeland" = "E06000064",
+  "north yorkshire" = "E06000065",
+  "craven" = "E06000065",
+  "hambleton" = "E06000065",
+  "harrogate" = "E06000065",
+  "richmondshire" = "E06000065",
+  "ryedale" = "E06000065",
+  "scarborough" = "E06000065",
+  "selby" = "E06000065",
+  "somerset" = "E06000066",
+  "mendip" = "E06000066",
+  "sedgemoor" = "E06000066",
+  "somerset west and taunton" = "E06000066",
+  "south somerset" = "E06000066",
+  "barnsley" = "E08000016",
+  "sheffield" = "E08000019",
+  "city of london" = "E09000001"
+)
+
+map_area <- function(code, name) {
+  code <- toupper(gsub("\\s+", "", clean(code)))
+  name <- stringr::str_to_lower(clean(name))
+
+  result <- unname(code_map[code])
+  missing <- is.na(result)
+  result[missing] <- unname(name_map[name[missing]])
+
+  result
+}
+
+#Births and stillbirths
+
+births_raw <- readxl::read_excel(
+  file.path(project_dir, "only_birth.xlsx"),
+  sheet = "Sheet1"
+)
+
+births_mapped <- births_raw %>%
+  dplyr::transmute(
+    source_code = clean(`Area of usual residence \r\nCode`),
+    source_name = clean(`Area of usual residence \r\nName`),
+    maternal_age_group = clean(`Age of Mother at birth (years)`),
+    live_births = num(`Number of live births`),
+    stillbirths = num(`Number of stillbirths`),
+    LAD24CD = map_area(source_code, source_name)
+  ) %>%
+  dplyr::filter(!is.na(LAD24CD))
+
+birth_totals <- births_mapped %>%
+  dplyr::filter(maternal_age_group == "All ages") %>%
+  dplyr::group_by(LAD24CD) %>%
+  dplyr::summarise(
+    live_births = sum(live_births, na.rm = TRUE),
+    stillbirths = sum(stillbirths, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#Ethnicity
+
+ethnicity_raw <- readxl::read_excel(
+  file.path(project_dir, "ethnicities.xlsx"),
+  sheet = "Dataset"
+)
+
+ethnicity_source <- ethnicity_raw %>%
+  dplyr::transmute(
+    source_name = clean(`Lower Tier Local Authorities`),
+    ethnic_group = clean(`Ethnic Group (detailed) (288 categories)`),
+    population = num(Observation),
+    LAD24CD = map_area(
+      rep(NA_character_, dplyr::n()),
+      source_name
+    )
+  ) %>%
+  dplyr::filter(
+    !is.na(LAD24CD),
+    !stringr::str_detect(
+      stringr::str_to_lower(ethnic_group),
+      "does not apply"
+    )
+  )
+
+ethnicity <- ethnicity_source %>%
+  dplyr::group_by(LAD24CD) %>%
+  dplyr::summarise(
+    census_population = sum(population, na.rm = TRUE),
+    white_british_population = sum(
+      population[
+        stringr::str_detect(
+          ethnic_group,
+          stringr::regex(
+            "^White:\\s*English, Welsh, Scottish, Northern Irish or British$",
+            ignore_case = TRUE
+          )
+        )
+      ],
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    ethnic_minority_pct = dplyr::if_else(
+      census_population > 0,
+      100 * (census_population - white_british_population) /
+        census_population,
+      NA_real_
+    )
+  )
+
+#IMD
+
+imd_raw <- readxl::read_excel(
+  file.path(
+    project_dir,
+    "File_1_IoD2025 Index of Multiple Deprivation.xlsx"
+  ),
+  sheet = "IMD25"
+)
+
+imd <- imd_raw %>%
+  dplyr::transmute(
+    source_code = clean(`Local Authority District code (2024)`),
+    source_name = clean(`Local Authority District name (2024)`),
+    LAD24CD = map_area(source_code, source_name),
+    imd_rank = num(
+      `Index of Multiple Deprivation (IMD) Rank (where 1 is most deprived)`
+    ),
+    imd_decile = num(
+      `Index of Multiple Deprivation (IMD) Decile (where 1 is most deprived 10% of LSOAs)`
+    )
+  ) %>%
+  dplyr::filter(!is.na(LAD24CD)) %>%
+  dplyr::group_by(LAD24CD) %>%
+  dplyr::summarise(
+    mean_lsoa_imd_rank = mean(imd_rank, na.rm = TRUE),
+    median_lsoa_imd_rank = median(imd_rank, na.rm = TRUE),
+    mean_lsoa_imd_decile = mean(imd_decile, na.rm = TRUE),
+    n_lsoas = sum(!is.na(imd_rank)),
+    .groups = "drop"
+  )
+
+#Fingertips data
+
+get_indicator <- function(id, output_name) {
+
+  dat <- fingertipsR::fingertips_data(
+    IndicatorID = id,
+    AreaTypeID = 501
+  )
+
+  if (nrow(dat) == 0) {
+    return(
+      tibble::tibble(LAD24CD = character(), value = numeric()) %>%
+        dplyr::rename(!!output_name := value)
+    )
+  }
+
+  area_code_col <- intersect(c("AreaCode", "Area Code"), names(dat))[1]
+  area_name_col <- intersect(c("AreaName", "Area Name"), names(dat))[1]
+
+  if (is.na(area_code_col) || !"Value" %in% names(dat)) {
+    stop(paste("Unexpected Fingertips columns for indicator", id))
+  }
+
+  area_name <- if (!is.na(area_name_col)) {
+    clean(dat[[area_name_col]])
+  } else {
+    rep(NA_character_, nrow(dat))
+  }
+
+  period_order <- if ("TimeperiodSort" %in% names(dat)) {
+    num(dat[["TimeperiodSort"]])
+  } else if ("Timeperiod" %in% names(dat)) {
+    num(stringr::str_extract(as.character(dat[["Timeperiod"]]), "\\d{4}"))
+  } else {
+    rep(0, nrow(dat))
+  }
+
+  dat %>%
+    dplyr::mutate(
+      LAD24CD = map_area(dat[[area_code_col]], area_name),
+      value = num(.data[["Value"]]),
+      period_order = period_order
+    ) %>%
+    dplyr::filter(!is.na(LAD24CD), !is.na(value)) %>%
+    dplyr::group_by(LAD24CD) %>%
+    dplyr::slice_max(
+      order_by = period_order,
+      n = 1,
+      with_ties = FALSE
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(LAD24CD, value) %>%
+    dplyr::rename(!!output_name := value)
+}
+
+get_maternal_age_35plus <- function() {
+
+  dat <- fingertipsR::fingertips_data(
+    IndicatorID = 92250,
+    AreaTypeID = 501
+  )
+
+  area_code_col <- intersect(c("AreaCode", "Area Code"), names(dat))[1]
+  area_name_col <- intersect(c("AreaName", "Area Name"), names(dat))[1]
+
+  area_name <- if (!is.na(area_name_col)) {
+    clean(dat[[area_name_col]])
+  } else {
+    rep(NA_character_, nrow(dat))
+  }
+
+  period_order <- if ("TimeperiodSort" %in% names(dat)) {
+    num(dat[["TimeperiodSort"]])
+  } else if ("Timeperiod" %in% names(dat)) {
+    num(stringr::str_extract(as.character(dat[["Timeperiod"]]), "\\d{4}"))
+  } else {
+    rep(0, nrow(dat))
+  }
+
+  dat %>%
+    dplyr::mutate(
+      LAD24CD = map_area(dat[[area_code_col]], area_name),
+      maternal_age_35plus_count = num(.data[["Count"]]),
+      period_order = period_order
+    ) %>%
+    dplyr::filter(!is.na(LAD24CD)) %>%
+    dplyr::group_by(LAD24CD) %>%
+    dplyr::slice_max(
+      order_by = period_order,
+      n = 1,
+      with_ties = FALSE
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(LAD24CD, maternal_age_35plus_count)
+}
+
+maternal_age_data <- get_maternal_age_35plus() %>%
+  dplyr::mutate(
+    maternal_age_35plus_count = dplyr::case_when(
+      LAD24CD == "E06000027" ~ 217,
+      LAD24CD == "E09000001" ~ 39,
+      TRUE ~ maternal_age_35plus_count
+    )
+  )
+
+smoking <- get_indicator(93085, "smoking_at_delivery_value") %>%
+  dplyr::mutate(
+    smoking_at_delivery_value = dplyr::if_else(
+      LAD24CD == "E09000001",
+      5.4,
+      smoking_at_delivery_value
+    )
+  )
+
+obesity <- get_indicator(93881, "obesity_value")
+
+#Combine missing LAD data
+
+final_data <- targets %>%
+  dplyr::left_join(birth_totals, by = "LAD24CD") %>%
+  dplyr::left_join(maternal_age_data, by = "LAD24CD") %>%
+  dplyr::left_join(ethnicity, by = "LAD24CD") %>%
+  dplyr::left_join(imd, by = "LAD24CD") %>%
+  dplyr::left_join(obesity, by = "LAD24CD") %>%
+  dplyr::left_join(smoking, by = "LAD24CD") %>%
+  dplyr::mutate(
+    smoking_at_delivery_value = dplyr::if_else(
+      LAD24CD == "E09000001",
+      5.4,
+      smoking_at_delivery_value
+    ),
+    stillbirth_rate_per_1000 = dplyr::if_else(
+      !is.na(live_births) & live_births > 0,
+      1000 * stillbirths / live_births,
+      NA_real_
+    )
+  )
+
+#Missing data report
+
+missing_report <- final_data %>%
+  dplyr::transmute(
+    LAD24CD,
+    LAD24NM,
+    missing_live_births = is.na(live_births),
+    missing_stillbirths = is.na(stillbirths),
+    missing_maternal_age_35plus_count = is.na(maternal_age_35plus_count),
+    missing_ethnicity = is.na(ethnic_minority_pct),
+    missing_imd = is.na(mean_lsoa_imd_rank),
+    missing_obesity = is.na(obesity_value),
+    missing_smoking = is.na(smoking_at_delivery_value)
+  )
+
+print(final_data, n = Inf)
+print(missing_report, n = Inf)
+
+#Save file
+writexl::write_xlsx(
+  list(
+    Final_Data = final_data,
+    Missing_Data = missing_report,
+    Ethnicity_Check = ethnicity,
+    Births_Check = birth_totals,
+    Maternal_Age_Check = maternal_age_data,
+    IMD_Check = imd
+  ),
+  path = file.path(project_dir, "LADs_all_data.xlsx")
+)
+
+```
+

@@ -1,0 +1,608 @@
+log(λi)=β0+β1(IMD ranki)+Si
+
+```{r}
+library(CARBayes)
+library(sf)
+library(spdep)
+library(dplyr)
+library(writexl)
+library(stringr)
+library(ggplot2)
+
+lad_model <- lad_data %>%
+  left_join(final, by = c("LAD24CD" = "area_code"))
+
+lad_model <- lad_model %>%
+  rename(
+    stillbirths = stillbirths.x,
+    births = births.x,
+    IMD_rank = IMD_rank.x
+  )
+
+# Scale predictors
+lad_model <- lad_model %>%
+  mutate(
+    IMD_rank_scaled = as.numeric(scale(IMD_rank))
+  )
+
+# England model data
+england_sf <- lad_model %>%
+  filter(
+    !is.na(IMD_rank_scaled),
+    !is.na(stillbirths),
+    !is.na(births),
+    births > 0,
+    str_detect(LAD24CD, "^E")
+  )
+
+england_sf <- england_sf[card(poly2nb(england_sf, queen = TRUE)) > 0, ]
+
+england_data <- england_sf %>%
+  st_drop_geometry()
+
+england_nb <- poly2nb(england_sf, queen = TRUE)
+
+england_W <- listw2mat(nb2listw(england_nb, style = "B"))
+england_W <- (england_W + t(england_W)) / 2
+england_W <- ifelse(england_W > 0, 1, 0)
+
+england_model_imd <- S.CARleroux(
+  formula = stillbirths ~ IMD_rank_scaled +
+    offset(log(births)),
+  family = "poisson",
+  data = england_data,
+  W = england_W,
+  burnin = 10000,
+  n.sample = 50000
+)
+
+# Regression coefficients
+england_results <- england_model_imd$summary.results %>%
+  as.data.frame() %>%
+  mutate(
+    parameter = rownames(.),
+    model = "England (IMD model)"
+  )
+
+beta_results <- england_results
+
+# Spatial correlation parameter
+spatial_results <- data.frame(
+  model = "England (IMD model)",
+  spatial_correlation = england_model_imd$summary.results["rho", "Mean"]
+)
+
+# Unexplained spatial variance
+variance_results <- data.frame(
+  model = "England (IMD model)",
+  unexplained_variance = var(as.vector(england_model_imd$samples$phi))
+)
+
+# Combine results
+CARBayes_results <- list(
+  regression_coefficients = beta_results,
+  spatial_correlation = spatial_results,
+  unexplained_variance = variance_results
+)
+
+write_xlsx(
+  CARBayes_results,
+  file.path(folder, "CARBayes_IMD_model_results.xlsx")
+)
+
+# Predicted stillbirth counts
+england_data$predicted_stillbirths <- england_model_imd$fitted.values
+
+# Observed vs predicted plot
+observed_predicted_plot <- ggplot(
+  england_data,
+  aes(x = predicted_stillbirths, y = stillbirths)
+) +
+  geom_point(colour = "steelblue", alpha = 0.7, size = 2) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    colour = "red",
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Observed vs Predicted Stillbirth Counts (IMD Spatial Model)",
+    x = "Predicted stillbirths",
+    y = "Observed stillbirths"
+  ) +
+  theme_minimal()
+
+ggsave(
+  file.path(folder, "observed_vs_predicted_IMD_model.png"),
+  observed_predicted_plot,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+observed_predicted_plot
+```
+
+```{r}
+library(CARBayes)
+library(spdep)
+library(writexl)
+
+n <- nrow(england_sf)
+
+observed <- england_data$stillbirths
+predicted <- numeric(n)
+
+for(i in 1:n){
+train_sf <- england_sf[-i, ]
+train_data <- england_data[-i, ]
+
+nb_train <- poly2nb(train_sf, queen = TRUE)
+
+keep <- card(nb_train) > 0
+
+train_sf <- train_sf[keep, ]
+train_data <- train_data[keep, ]
+
+nb_train <- poly2nb(train_sf, queen = TRUE)
+
+W_train <- listw2mat(nb2listw(nb_train, style = "B", zero.policy = TRUE))
+W_train <- (W_train + t(W_train)) / 2
+W_train <- ifelse(W_train > 0, 1, 0)
+
+  model <- S.CARleroux(
+    formula =
+      stillbirths ~
+      IMD_rank_scaled +
+      offset(log(births)),
+    family = "poisson",
+    data = train_data,
+    W = W_train,
+    burnin = 10000,
+    n.sample = 50000
+  )
+
+  beta <- model$samples$beta
+
+  beta_mean <- apply(beta, 2, mean)
+
+  eta <-
+    beta_mean[1] +
+    beta_mean[2] * england_data$IMD_rank_scaled[i] +
+    log(england_data$births[i])
+
+  predicted[i] <- exp(eta)
+}
+
+rmse <- sqrt(mean((observed - predicted)^2))
+
+bias <- mean(predicted - observed)
+
+results <- data.frame(
+  LAD = england_data$LAD24CD,
+  observed = observed,
+  predicted = predicted,
+  error = predicted - observed
+)
+
+print(rmse)
+print(bias)
+
+write_xlsx(
+  list(
+    predictions = results,
+    validation = data.frame(
+      RMSE = rmse,
+      Bias = bias
+    )
+  ),
+  file.path(folder, "LOOCV_IMD_model.xlsx")
+)
+```
+
+```{r}
+library(sf)
+library(ggplot2)
+library(viridis)
+library(dplyr)
+library(stringr)
+
+# Create folder for IMD model plots
+
+plot_folder <- file.path(folder, "Deprivation Model Plots")
+
+if(!dir.exists(plot_folder)){
+  dir.create(plot_folder)
+}
+
+# Download full UK LAD shapefile
+
+url <- paste0(
+  "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/",
+  "Local_Authority_Districts_May_2024_Boundaries_UK_BGC/FeatureServer/0/query",
+  "?where=1%3D1&outFields=*&f=geojson"
+)
+
+lad_uk <- st_read(
+  url,
+  quiet = TRUE
+)
+
+# Prepare England model data
+
+england_plot_data <- england_sf %>%
+  st_drop_geometry() %>%
+  mutate(
+    stillbirth_rate_per_1000 = (stillbirths / births) * 1000
+  )
+
+
+# Join England results onto UK shapefile
+
+lad_data <- lad_uk %>%
+  left_join(
+    england_plot_data %>%
+      select(
+        LAD24CD,
+        stillbirth_rate_per_1000,
+        IMD_rank
+      ),
+    by = "LAD24CD"
+  )
+
+
+# Stillbirth rate map
+
+stillbirth_plot <- ggplot(lad_data) +
+
+  geom_sf(
+    aes(fill = stillbirth_rate_per_1000),
+    colour = "white",
+    linewidth = 0.1
+  ) +
+
+  scale_fill_viridis_c(
+    option = "plasma",
+    na.value = "grey90",
+    name = "Stillbirths\nper 1000 births"
+  ) +
+
+  labs(
+    title = "Stillbirth Rate by Local Authority District"
+  ) +
+
+  theme_void()
+
+
+ggsave(
+  filename = file.path(
+    plot_folder,
+    "stillbirth_rate_map.png"
+  ),
+  plot = stillbirth_plot,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+
+
+# IMD map
+
+imd_plot <- ggplot(lad_data) +
+
+  geom_sf(
+    aes(fill = IMD_rank),
+    colour = "white",
+    linewidth = 0.1
+  ) +
+
+  scale_fill_viridis_c(
+    option = "magma",
+    direction = -1,
+    na.value = "grey90",
+    name = "IMD Rank"
+  ) +
+
+  labs(
+    title = "Index of Multiple Deprivation by Local Authority District"
+  ) +
+
+  theme_void()
+
+
+ggsave(
+  filename = file.path(
+    plot_folder,
+    "IMD_map.png"
+  ),
+  plot = imd_plot,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+
+
+# Display plots
+
+stillbirth_plot
+imd_plot
+```
+
+```{r}
+library(ggplot2)
+library(scales)
+library(dplyr)
+
+# Create scatter plot folder
+
+scatter_folder <- file.path(folder, "Deprivation Model Plots", "scatter plots")
+
+dir.create(
+  scatter_folder,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+# Prepare data
+
+scatter_data <- england_data %>%
+  mutate(
+    stillbirth_rate_per_1000 = (stillbirths / births) * 1000,
+    log_stillbirth_rate = log1p(stillbirth_rate_per_1000)
+  )
+
+
+# Stillbirth rate vs IMD
+
+imd_scatter <- ggplot(
+  scatter_data %>% filter(!is.na(IMD_rank)),
+  aes(
+    x = IMD_rank,
+    y = log_stillbirth_rate
+  )
+) +
+
+  geom_point(
+    alpha = 0.7,
+    colour = "steelblue"
+  ) +
+
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    colour = "red"
+  ) +
+
+  labs(
+    title = "Stillbirth Rate vs Index of Multiple Deprivation",
+    x = "IMD Rank (lower rank = more deprived)",
+    y = "Log(1 + stillbirth rate per 1,000 births)"
+  ) +
+
+  theme_minimal()
+
+
+ggsave(
+  file.path(
+    scatter_folder,
+    "scatter_IMD.png"
+  ),
+  imd_scatter,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+
+# Display plot
+
+imd_scatter
+```
+
+```{r}
+library(ggplot2)
+
+
+plot_folder <- file.path(folder, "Deprivation Model Plots")
+
+
+# Predicted stillbirth counts from IMD model
+
+england_data$predicted_stillbirths <- england_model_imd$fitted.values
+
+
+# Observed vs predicted plot
+
+observed_predicted_plot <- ggplot(
+  england_data,
+  aes(
+    x = predicted_stillbirths,
+    y = stillbirths
+  )
+) +
+
+  geom_point(
+    colour = "steelblue",
+    alpha = 0.7,
+    size = 2
+  ) +
+
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    colour = "red",
+    linetype = "dashed"
+  ) +
+
+  labs(
+    title = "Observed vs Predicted Stillbirth Counts",
+    x = "Predicted stillbirths",
+    y = "Observed stillbirths"
+  ) +
+
+  theme_minimal()
+
+
+# Save plot
+
+ggsave(
+  file.path(
+    plot_folder,
+    "observed_vs_predicted_IMD_model.png"
+  ),
+  observed_predicted_plot,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+
+# Display plot
+
+observed_predicted_plot
+```
+
+```{r}
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(viridis)
+
+# Hotspot threshold
+
+threshold <- 3.9
+
+
+# Posterior fitted values from IMD model
+
+posterior_lambda <- england_model_imd$samples$fitted
+
+
+# Convert posterior counts to rates per 1000 births
+
+posterior_rate <- sweep(
+  posterior_lambda,
+  2,
+  england_data$births,
+  "/"
+) * 1000
+
+
+# Posterior probability of exceeding threshold
+
+hotspot_probability <- colMeans(
+  posterior_rate > threshold
+)
+
+
+# Add probabilities to England spatial data
+
+england_sf$hotspot_probability <- hotspot_probability
+
+
+# Load UK LAD map
+
+uk_lad <- st_read(
+  file.path(folder, "LAD_2024_UK_BGC.gpkg"),
+  quiet = TRUE
+)
+
+
+# Join hotspot probabilities
+
+uk_map <- uk_lad %>%
+  left_join(
+    england_sf %>%
+      st_drop_geometry() %>%
+      select(
+        LAD24CD,
+        hotspot_probability
+      ),
+    by = "LAD24CD"
+  )
+
+
+# Plot hotspot probability map
+
+hotspot_map <- ggplot() +
+
+  # UK background
+  geom_sf(
+    data = uk_map,
+    fill = "grey90",
+    colour = "white",
+    linewidth = 0.15
+  ) +
+
+  # England posterior probabilities
+  geom_sf(
+    data = filter(
+      uk_map,
+      !is.na(hotspot_probability)
+    ),
+    aes(
+      fill = hotspot_probability
+    ),
+    colour = "white",
+    linewidth = 0.15
+  ) +
+
+  scale_fill_viridis_c(
+    option = "plasma",
+    limits = c(0, 1),
+    na.value = "grey90",
+    name = "Posterior\nprobability"
+  ) +
+
+  labs(
+    title = paste(
+      "Posterior probability of exceeding 3.9 stillbirths per 1,000 births"
+    ),
+  ) +
+
+  theme_void()
+
+
+# Save plot
+
+ggsave(
+  file.path(
+    plot_folder,
+    "posterior_hotspot_probability_IMD_model.png"
+  ),
+  hotspot_map,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+
+# Display plot
+
+hotspot_map
+```
+```{r}
+# Find LADs missing from the deprivation model dataset
+
+missing_lads <- lad_uk %>%
+  filter(
+    str_detect(LAD24CD, "^E"),
+    !LAD24CD %in% england_data$LAD24CD
+  ) %>%
+  st_drop_geometry() %>%
+  select(
+    LAD24CD,
+    LAD24NM
+  )
+
+print(missing_lads)
+
+print(
+  missing_lads,
+  row.names = FALSE
+)
+```
+

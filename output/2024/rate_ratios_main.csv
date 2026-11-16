@@ -1,0 +1,7 @@
+"var","label","per","RR","lo","hi","p_gt1"
+"imd_dep_pctile","Deprivation (IMD 2025, mean LSOA percentile)","10 percentile points",1.03562735894264,0.984977818235019,1.08519175457087,0.92225
+"pct_black","Black ethnicity (% population)","5 percentage points",1.04101491760798,0.973134316577273,1.11468895343705,0.88675
+"pct_south_asian","South Asian ethnicity (% population)","5 percentage points",1.04708331467168,1.01227549125773,1.08437145180005,0.995
+"pct_age35plus","Mothers aged 35+ (% deliveries)","5 percentage points",1.03566295389536,0.911174977069937,1.18328512856398,0.69725
+"pct_smoking","Smoking at time of delivery (%)","2 percentage points",1.00484689394732,0.930650009791701,1.08003998758945,0.54625
+"pct_obese_preg","Obesity in early pregnancy (%)","5 percentage points",1.11854868585277,0.938846014195449,1.33215311508103,0.88975

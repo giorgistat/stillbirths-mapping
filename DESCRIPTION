@@ -1,0 +1,35 @@
+Package: stillbirthmap
+Type: Package
+Title: Bayesian Small-Area Mapping of Stillbirth Risk in England
+Version: 0.1.0
+Authors@R: c(
+    person("Emanuele", "Giorgi", email = "e.giorgi@bham.ac.uk", role = c("aut", "cre")),
+    person("Ranveer", "Basra", role = "ctb", comment = "MSc thesis analysis"))
+Description: Data and code for a Bayesian small-area analysis of stillbirth risk across
+    English local authority districts. Includes harmonised LAD-level datasets (ONS births and
+    stillbirths, IMD 2025, Census 2021 ethnicity, OHID Fingertips maternity indicators),
+    boundaries and adjacency, a Poisson model with IID, BYM2 or Leroux random effects, a joint
+    model treating obesity in early pregnancy as a latent LAD-level variable observed at
+    upper-tier level, cross-validation with proper scoring rules, and exceedance-probability maps.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: false
+Depends: R (>= 4.2)
+Imports:
+    cmdstanr,
+    posterior,
+    ggplot2,
+    patchwork,
+    scales,
+    sf,
+    spdep,
+    stats,
+    utils,
+    tools,
+    parallel
+Suggests:
+    dplyr,
+    tidyr,
+    readxl
+Additional_repositories: https://stan-dev.r-universe.dev
+Config/roxygen2/version: 8.1.0

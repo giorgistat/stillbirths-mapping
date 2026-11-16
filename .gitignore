@@ -1,0 +1,6 @@
+*.rds
+output/fits/
+.Rhistory
+.RData
+.Rproj.user/
+output/log_*.txt

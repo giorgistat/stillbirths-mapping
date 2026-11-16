@@ -1,0 +1,7 @@
+"dropped","label","dELPD","se","dRPS_pct"
+"pct_south_asian","South Asian ethnicity (% population)",3.16370453062128,2.42296990837078,2.31437268479637
+"imd_dep_pctile","Deprivation (IMD 2025, mean LSOA percentile)",0.527255826752952,1.42850376814403,-0.0983281940939551
+"pct_black","Black ethnicity (% population)",0.499372177250737,1.25028823093192,0.327981537002797
+"pct_obese_preg","Obesity in early pregnancy (%)",0.373695000078814,1.18302387000535,0.469560532179059
+"pct_age35plus","Mothers aged 35+ (% deliveries)",-0.513805842228518,0.597575769598478,-0.0604919661781778
+"pct_smoking","Smoking at time of delivery (%)",-0.608808566673419,0.271977069847061,-0.205680860255719

@@ -1,0 +1,601 @@
+```{r}
+#Libraries and project directory
+
+library(readxl)
+library(dplyr)
+library(sf)
+library(spdep)
+library(CARBayes)
+library(ggplot2)
+library(writexl)
+library(stringr)
+library(tibble)
+
+folder <- "C:/Users/ranve/Documents/Bioinformatics/Individual project"
+
+
+#Helper functions
+
+clean <- function(x) str_squish(as.character(x))
+num <- function(x) suppressWarnings(as.numeric(gsub(",", "", clean(x))))
+
+correct_LAD_codes <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == "E08000038"] <- "E08000016"
+  x[x == "E08000039"] <- "E08000019"
+  x
+}
+
+
+#Retrieve Fingertips indicators
+
+get_indicator <- function(id, variable) {
+  fingertipsR::fingertips_data(IndicatorID = id, AreaTypeID = 501) %>%
+    filter(Timeperiod == "2024/25", AreaType == "Districts & UAs (from Apr 2023)") %>%
+    transmute(LAD24CD = correct_LAD_codes(AreaCode), "{variable}" := num(Value)) %>%
+    distinct(LAD24CD, .keep_all = TRUE)
+}
+
+smoking_clean <- get_indicator(93085, "smoking_at_delivery")
+age_clean <- get_indicator(92250, "maternal_age_35plus")
+
+obesity_data <- tryCatch(
+  fingertipsR::fingertips_data(IndicatorID = 93881, AreaTypeID = 501),
+  error = function(e) NULL
+)
+
+obesity_clean <- if (is.null(obesity_data)) {
+  tibble(LAD24CD = character(), obesity = numeric())
+} else {
+  obesity_data %>%
+    filter(Timeperiod == "2024/25", AreaType == "Districts & UAs (from Apr 2023)") %>%
+    transmute(LAD24CD = correct_LAD_codes(AreaCode), obesity = num(Value)) %>%
+    distinct(LAD24CD, .keep_all = TRUE)
+}
+
+
+#Combine existing and supplemental LAD data
+
+full_extension <- england_data %>%
+  select(LAD24CD, LAD24NM, births, stillbirths, IMD_rank,
+         ethnic_minority_pct = ethnic_minority_pct.x) %>%
+  mutate(LAD24CD = correct_LAD_codes(LAD24CD)) %>%
+  left_join(smoking_clean, by = "LAD24CD") %>%
+  left_join(age_clean, by = "LAD24CD") %>%
+  left_join(obesity_clean, by = "LAD24CD") %>%
+  filter(str_detect(LAD24CD, "^E"))
+
+requested_LADs <- read_excel(file.path(folder, "requested_LADs_all_data.xlsx")) %>%
+  mutate(
+    LAD24CD = correct_LAD_codes(LAD24CD),
+    LAD24NM = clean(LAD24NM),
+    LAD24CD = if_else(
+      str_detect(LAD24CD, "E06000052.*E06000053|E06000053.*E06000052"),
+      "E06000052_E06000053",
+      LAD24CD
+    ),
+    maternal_age_35plus = if_else(live_births > 0, 100 * maternal_age_35plus_count / live_births, NA_real_)
+  ) %>%
+  transmute(
+    LAD24CD, LAD24NM,
+    births = live_births,
+    stillbirths,
+    IMD_rank = mean_lsoa_imd_rank,
+    ethnic_minority_pct,
+    smoking_at_delivery = smoking_at_delivery_value,
+    maternal_age_35plus,
+    obesity = obesity_value
+  )
+
+full_extension <- full_extension %>%
+  filter(!LAD24CD %in% requested_LADs$LAD24CD) %>%
+  bind_rows(requested_LADs) %>%
+  arrange(LAD24CD)
+
+
+#Create complete-case modelling dataset
+
+full_extension_complete <- full_extension %>%
+  filter(
+    !is.na(births), births > 0,
+    !is.na(stillbirths),
+    !is.na(IMD_rank),
+    !is.na(ethnic_minority_pct),
+    !is.na(smoking_at_delivery),
+    !is.na(maternal_age_35plus),
+    !is.na(obesity)
+  ) %>%
+  mutate(
+    observed_rate_per_1000 = stillbirths / births * 1000,
+    IMD_scaled = as.numeric(scale(IMD_rank)),
+    ethnicity_scaled = as.numeric(scale(ethnic_minority_pct)),
+    smoking_scaled = as.numeric(scale(smoking_at_delivery)),
+    age_scaled = as.numeric(scale(maternal_age_35plus)),
+    obesity_scaled = as.numeric(scale(obesity))
+  )
+
+if (nrow(full_extension_complete) < 2) {
+  stop("Insufficient complete LAD data to fit the model.")
+}
+
+full_model_data <- as.data.frame(full_extension_complete)
+
+
+#Download and prepare English LAD boundaries
+
+url <- paste0(
+  "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/",
+  "Local_Authority_Districts_May_2024_Boundaries_UK_BGC/",
+  "FeatureServer/0/query?where=1%3D1&outFields=*&f=geojson"
+)
+
+lad_uk <- st_read(url, quiet = TRUE) %>%
+  mutate(LAD24CD = correct_LAD_codes(LAD24CD))
+
+england_sf_base <- lad_uk %>%
+  filter(str_detect(LAD24CD, "^E")) %>%
+  st_make_valid()
+
+
+#Combine Cornwall and Isles of Scilly
+
+cornwall_scilly_sf <- england_sf_base %>%
+  filter(LAD24CD %in% c("E06000052", "E06000053")) %>%
+  summarise(LAD24CD = "E06000052_E06000053", LAD24NM = "Cornwall and Isles of Scilly", do_union = TRUE)
+
+england_sf_model <- england_sf_base %>%
+  filter(!LAD24CD %in% c("E06000052", "E06000053")) %>%
+  bind_rows(cornwall_scilly_sf) %>%
+  arrange(LAD24CD)
+
+full_sf <- england_sf_model %>%
+  filter(LAD24CD %in% full_model_data$LAD24CD) %>%
+  arrange(match(LAD24CD, full_model_data$LAD24CD))
+
+
+#Create Queen-contiguity adjacency matrix
+
+full_sf <- st_make_valid(full_sf)
+full_nb <- poly2nb(full_sf, queen = TRUE)
+full_W <- nb2mat(full_nb, style = "B", zero.policy = TRUE)
+
+isolated <- which(rowSums(full_W) == 0)
+
+if (length(isolated) > 0) {
+  full_sf_27700 <- st_transform(full_sf, 27700)
+  representative_points <- st_point_on_surface(full_sf_27700)
+  coordinates <- st_coordinates(representative_points)
+  distance_matrix <- as.matrix(dist(coordinates))
+
+  for (i in isolated) {
+    distance_matrix[i, i] <- Inf
+    nearest_idx <- which.min(distance_matrix[i, ])
+    full_W[i, nearest_idx] <- 1
+    full_W[nearest_idx, i] <- 1
+  }
+}
+
+rownames(full_W) <- colnames(full_W) <- full_sf$LAD24CD
+
+
+#Fit the Bayesian spatial model
+
+final_model <- S.CARleroux(
+  formula = stillbirths ~ IMD_scaled + ethnicity_scaled + smoking_scaled + age_scaled + obesity_scaled + offset(log(births)),
+  family = "poisson",
+  data = full_model_data,
+  W = full_W,
+  burnin = 10000,
+  n.sample = 50000,
+  thin = 1,
+  n.chains = 1,
+  n.cores = 1,
+  verbose = TRUE
+)
+
+
+#Summarise posterior coefficients
+
+beta_samples <- final_model$samples$beta
+
+beta_names <- c("Intercept", "IMD_scaled", "ethnicity_scaled", "smoking_scaled", "age_scaled", "obesity_scaled")
+colnames(beta_samples) <- beta_names
+
+beta_summary <- data.frame(
+  Variable = beta_names,
+  Posterior_Mean = apply(beta_samples, 2, mean),
+  Lower_95_CrI = apply(beta_samples, 2, quantile, probs = 0.025),
+  Upper_95_CrI = apply(beta_samples, 2, quantile, probs = 0.975)
+) %>%
+  mutate(
+    Rate_Ratio = exp(Posterior_Mean),
+    RR_Lower_95_CrI = exp(Lower_95_CrI),
+    RR_Upper_95_CrI = exp(Upper_95_CrI)
+  )
+
+
+#Calculate posterior LAD-specific rates
+
+phi_samples <- final_model$samples$phi
+
+X <- model.matrix(~ IMD_scaled + ethnicity_scaled + smoking_scaled + age_scaled + obesity_scaled, data = full_model_data)
+
+n_post <- nrow(beta_samples)
+n_lad <- nrow(full_model_data)
+
+posterior_rate <- matrix(NA_real_, nrow = n_post, ncol = n_lad)
+
+if (nrow(phi_samples) != n_post || ncol(phi_samples) != n_lad) {
+  stop("Posterior spatial effects do not match the model data.")
+}
+
+for (s in seq_len(n_post)) {
+  eta <- as.numeric(X %*% beta_samples[s, ]) + phi_samples[s, ]
+  posterior_rate[s, ] <- exp(eta) * 1000
+}
+
+
+#Calculate hotspot probabilities
+
+threshold_rate <- 3.9
+
+hotspot_results <- data.frame(
+  LAD24CD = full_model_data$LAD24CD,
+  LAD24NM = full_model_data$LAD24NM,
+  births = full_model_data$births,
+  stillbirths = full_model_data$stillbirths,
+  observed_rate_per_1000 = full_model_data$observed_rate_per_1000,
+  posterior_mean_rate = colMeans(posterior_rate),
+  posterior_median_rate = apply(posterior_rate, 2, median),
+  posterior_lower_95 = apply(posterior_rate, 2, quantile, probs = 0.025),
+  posterior_upper_95 = apply(posterior_rate, 2, quantile, probs = 0.975),
+  probability_rate_above_3_9 = colMeans(posterior_rate > threshold_rate)
+) %>%
+  mutate(
+    hotspot_probability_category = case_when(
+      probability_rate_above_3_9 >= 0.95 ~ "Very high probability",
+      probability_rate_above_3_9 >= 0.80 ~ "High probability",
+      probability_rate_above_3_9 >= 0.50 ~ "Moderate probability",
+      probability_rate_above_3_9 >= 0.20 ~ "Low probability",
+      TRUE ~ "Very low probability"
+    ),
+    hotspot_95 = probability_rate_above_3_9 >= 0.95
+  )
+
+top_hotspots <- hotspot_results %>%
+  arrange(desc(probability_rate_above_3_9))
+
+high_probability_hotspots <- hotspot_results %>%
+  filter(hotspot_95) %>%
+  arrange(desc(probability_rate_above_3_9))
+
+
+#Prepare UK map data
+
+lad_uk_map <- lad_uk %>%
+  filter(!LAD24CD %in% c("E06000052", "E06000053")) %>%
+  bind_rows(cornwall_scilly_sf)
+
+posterior_map_data <- lad_uk_map %>%
+  left_join(
+    hotspot_results %>%
+      select(LAD24CD, probability_rate_above_3_9, posterior_mean_rate, posterior_median_rate, posterior_lower_95, posterior_upper_95),
+    by = "LAD24CD"
+  )
+
+
+#Plot posterior hotspot probabilities
+
+posterior_hotspot_plot <- ggplot(posterior_map_data) +
+  geom_sf(aes(fill = probability_rate_above_3_9), colour = "white", linewidth = 0.1) +
+  scale_fill_viridis_c(
+    option = "plasma", limits = c(0, 1),
+    breaks = c(0, 0.25, 0.50, 0.75, 0.95, 1),
+    labels = c("0%", "25%", "50%", "75%", "95%", "100%"),
+    na.value = "grey90",
+    name = "Posterior probability\nrate > 3.9 per 1,000"
+  ) +
+  labs(title = "Posterior Probability of Stillbirth Rate Exceeding 3.9 per 1,000") +
+  theme_void() +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    legend.position = "right",
+    legend.key.height = grid::unit(1.2, "cm"),
+    legend.key.width = grid::unit(0.6, "cm")
+  )
+
+ggsave(file.path(folder, "FINAL_posterior_hotspot_probability_map_full_model.png"), plot = posterior_hotspot_plot, width = 8, height = 10, dpi = 300)
+print(posterior_hotspot_plot)
+
+
+#Plot binary 95% hotspot classification
+
+hotspot_map_data <- lad_uk_map %>%
+  left_join(hotspot_results %>% select(LAD24CD, hotspot_95), by = "LAD24CD")
+
+binary_hotspot_map <- ggplot(hotspot_map_data) +
+  geom_sf(aes(fill = hotspot_95), colour = "grey40", linewidth = 0.15) +
+  scale_fill_manual(
+    values = c("FALSE" = "grey90", "TRUE" = "red"),
+    na.value = "grey90",
+    labels = c("FALSE" = "P(rate > 3.9) < 0.95", "TRUE" = "P(rate > 3.9) >= 0.95"),
+    name = "Hotspot"
+  ) +
+  labs(title = "Posterior Probability Hotspots for Stillbirth Risk") +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    legend.position = "right",
+    legend.key.height = grid::unit(1.2, "cm")
+  )
+
+ggsave(file.path(folder, "FINAL_binary_hotspot_map_full_model_95percent.png"), plot = binary_hotspot_map, width = 8, height = 10, dpi = 300)
+print(binary_hotspot_map)
+
+
+#Export final results
+
+write_xlsx(
+  list(
+    hotspot_results = hotspot_results,
+    coefficient_results = beta_summary,
+    top_hotspots = top_hotspots,
+    high_probability_hotspots = high_probability_hotspots,
+    complete_model_data = full_extension_complete
+  ),
+  file.path(folder, "FINAL_full_model_hotspot_results.xlsx")
+)
+```
+
+```{r}
+#Prepare map dataset
+
+lad_data <- lad_uk_map %>%
+  left_join(
+    full_extension_complete %>%
+      select(
+        LAD24CD,
+        stillbirth_rate_per_1000 = observed_rate_per_1000,
+        IMD_rank,
+        ethnic_minority_pct
+      ),
+    by = "LAD24CD"
+  )
+
+
+#Stillbirth rate map
+
+stillbirth_plot <- ggplot(lad_data) +
+  geom_sf(aes(fill = stillbirth_rate_per_1000), colour = "white", linewidth = 0.1) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey95", name = "Stillbirths\nper 1,000") +
+  theme_void() +
+  labs(title = "Stillbirth Rate by Local Authority District") +
+  theme(plot.title = element_text(face = "bold", size = 15), legend.position = "right")
+
+print(stillbirth_plot)
+
+ggsave(file.path(folder, "stillbirth_rate_map.png"), stillbirth_plot, width = 8, height = 10, dpi = 300)
+
+
+#IMD map
+
+imd_plot <- ggplot(lad_data) +
+  geom_sf(aes(fill = IMD_rank), colour = "white", linewidth = 0.1) +
+  scale_fill_viridis_c(option = "magma", direction = -1, na.value = "grey95", name = "Mean LAD-level\nIMD Rank") +
+  theme_void() +
+  labs(title = "Index of Multiple Deprivation by Local Authority District") +
+  theme(plot.title = element_text(face = "bold", size = 15), legend.position = "right")
+
+print(imd_plot)
+
+ggsave(file.path(folder, "imd_map.png"), imd_plot, width = 8, height = 10, dpi = 300)
+
+
+#Ethnic minority population map
+
+ethnicity_plot <- ggplot(lad_data) +
+  geom_sf(aes(fill = ethnic_minority_pct), colour = "white", linewidth = 0.1) +
+  scale_fill_viridis_c(option = "cividis", na.value = "grey95", name = "Ethnic Minority\nPopulation (%)") +
+  theme_void() +
+  labs(title = "Ethnic Minority Population by Local Authority District") +
+  theme(plot.title = element_text(face = "bold", size = 15), legend.position = "right")
+
+print(ethnicity_plot)
+
+ggsave(file.path(folder, "ethnic_minority_map.png"), ethnicity_plot, width = 8, height = 10, dpi = 300)
+```
+
+```{r}
+#Libraries
+
+library(CARBayes)
+library(spdep)
+library(sf)
+library(writexl)
+
+
+#Check data and spatial order
+
+n <- nrow(full_model_data)
+
+stopifnot(nrow(full_sf) == n, identical(full_sf$LAD24CD, full_model_data$LAD24CD))
+
+observed <- full_model_data$stillbirths
+predicted <- numeric(n)
+
+
+#Create spatial weights matrix
+
+nb_full_loocv <- poly2nb(full_sf, queen = TRUE)
+W_full_loocv <- nb2mat(nb_full_loocv, style = "B", zero.policy = TRUE)
+
+zero_idx <- which(rowSums(W_full_loocv) == 0)
+
+if (length(zero_idx) > 0) {
+  full_points <- st_point_on_surface(st_transform(full_sf, 27700))
+  distance_matrix <- as.matrix(dist(st_coordinates(full_points)))
+
+  for (j in zero_idx) {
+    distance_matrix[j, j] <- Inf
+    nearest <- which.min(distance_matrix[j, ])
+    W_full_loocv[j, nearest] <- 1
+    W_full_loocv[nearest, j] <- 1
+  }
+}
+
+W_full_loocv <- ifelse((W_full_loocv + t(W_full_loocv)) > 0, 1, 0)
+diag(W_full_loocv) <- 0
+
+stopifnot(isSymmetric(W_full_loocv), all(rowSums(W_full_loocv) > 0))
+
+
+#Run leave-one-out cross-validation
+
+set.seed(123)
+
+predictors <- c("IMD_rank", "ethnic_minority_pct", "smoking_at_delivery", "maternal_age_35plus", "obesity")
+scaled_names <- c("IMD_scaled", "ethnicity_scaled", "smoking_scaled", "age_scaled", "obesity_scaled")
+
+for (i in 1:n) {
+
+  train_data <- full_model_data[-i, ]
+  train_sf <- full_sf[-i, ]
+  test_data <- full_model_data[i, ]
+
+  #Standardise predictors using training data
+
+  for (j in seq_along(predictors)) {
+    variable <- predictors[j]
+    scaled_variable <- scaled_names[j]
+
+    training_mean <- mean(train_data[[variable]])
+    training_sd <- sd(train_data[[variable]])
+
+    if (!is.finite(training_sd) || training_sd == 0) {
+      stop(paste("Invalid standard deviation for", variable, "in fold", i))
+    }
+
+    train_data[[scaled_variable]] <- (train_data[[variable]] - training_mean) / training_sd
+    test_data[[scaled_variable]] <- (test_data[[variable]] - training_mean) / training_sd
+  }
+
+
+  #Create training spatial weights
+
+  W_train <- W_full_loocv[-i, -i, drop = FALSE]
+  zero_train_idx <- which(rowSums(W_train) == 0)
+
+  if (length(zero_train_idx) > 0) {
+    train_points <- st_point_on_surface(st_transform(train_sf, 27700))
+    train_distances <- as.matrix(dist(st_coordinates(train_points)))
+
+    for (j in zero_train_idx) {
+      train_distances[j, j] <- Inf
+      nearest <- which.min(train_distances[j, ])
+      W_train[j, nearest] <- 1
+      W_train[nearest, j] <- 1
+    }
+  }
+
+  W_train <- ifelse((W_train + t(W_train)) > 0, 1, 0)
+  diag(W_train) <- 0
+
+  stopifnot(isSymmetric(W_train), all(rowSums(W_train) > 0), nrow(W_train) == nrow(train_data))
+
+
+  #Fit the five-predictor CAR Leroux model
+
+  model <- S.CARleroux(
+    formula = stillbirths ~ IMD_scaled + ethnicity_scaled + smoking_scaled + age_scaled + obesity_scaled + offset(log(births)),
+    family = "poisson",
+    data = train_data,
+    W = W_train,
+    burnin = 10000,
+    n.sample = 50000,
+    thin = 1,
+    n.chains = 1,
+    n.cores = 1,
+    verbose = FALSE
+  )
+
+
+  #Extract posterior samples
+
+  beta_draws <- model$samples$beta
+  phi_draws <- model$samples$phi
+  rho_draws <- as.numeric(model$samples$rho)
+  tau2_draws <- as.numeric(model$samples$tau2)
+
+  if (ncol(beta_draws) != 6 || ncol(phi_draws) != nrow(train_data) || nrow(beta_draws) != nrow(phi_draws) || length(rho_draws) != nrow(beta_draws) || length(tau2_draws) != nrow(beta_draws)) {
+    stop(paste("Posterior sample dimensions do not match in fold", i))
+  }
+
+
+  #Calculate fixed-effect prediction
+
+  x_test <- c(1, test_data$IMD_scaled, test_data$ethnicity_scaled, test_data$smoking_scaled, test_data$age_scaled, test_data$obesity_scaled)
+  eta_fixed <- as.numeric(beta_draws %*% x_test) + log(test_data$births)
+
+
+  #Predict held-out spatial effect
+
+  w_heldout <- W_full_loocv[i, -i]
+
+  if (sum(w_heldout) == 0) {
+    full_points <- st_point_on_surface(st_transform(full_sf, 27700))
+    heldout_coordinates <- st_coordinates(full_points[i, ])
+    training_coordinates <- st_coordinates(full_points[-i, ])
+
+    distances <- sqrt(rowSums((training_coordinates - matrix(heldout_coordinates, nrow = nrow(training_coordinates), ncol = 2, byrow = TRUE))^2))
+    nearest <- which.min(distances)
+    w_heldout[nearest] <- 1
+  }
+
+  heldout_degree <- sum(w_heldout)
+  spatial_mean <- numeric(nrow(phi_draws))
+  spatial_variance <- numeric(nrow(phi_draws))
+
+  for (s in 1:nrow(phi_draws)) {
+    denominator <- 1 - rho_draws[s] + rho_draws[s] * heldout_degree
+    spatial_mean[s] <- rho_draws[s] * sum(w_heldout * phi_draws[s, ]) / denominator
+    spatial_variance[s] <- tau2_draws[s] / denominator
+  }
+
+
+  #Calculate predicted stillbirth count
+
+  predicted_draws <- exp(eta_fixed + spatial_mean + 0.5 * spatial_variance)
+  predicted[i] <- mean(predicted_draws)
+
+}
+
+
+#Calculate cross-validation performance
+
+rmse <- sqrt(mean((observed - predicted)^2))
+mae <- mean(abs(observed - predicted))
+bias <- mean(predicted - observed)
+
+
+#Prepare results
+
+results <- data.frame(
+  LAD = full_model_data$LAD24CD,
+  LAD_name = full_model_data$LAD24NM,
+  observed = observed,
+  predicted = predicted,
+  error = predicted - observed
+)
+
+
+#Export results
+
+write_xlsx(
+  list(
+    predictions = results,
+    validation = data.frame(RMSE = rmse, MAE = mae, Bias = bias)
+  ),
+  file.path(folder, "LOOCV_full_model.xlsx")
+)
+```
+

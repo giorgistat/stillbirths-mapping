@@ -1,0 +1,32 @@
+"model","var","label","per","RR","lo","hi","p_gt1"
+"deprivation_iid","imd_dep_pctile","Deprivation (IMD 2025, mean LSOA percentile)","10 percentile points",1.08815478827734,1.05300132820556,1.12301140997909,1
+"adult_obesity_iid","imd_dep_pctile","Deprivation (IMD 2025, mean LSOA percentile)","10 percentile points",1.02949399504198,0.980541348591182,1.08017482771849,0.88725
+"adult_obesity_iid","pct_black","Black ethnicity (% population)","5 percentage points",1.05568572310973,0.992061213608733,1.12217996006823,0.95325
+"adult_obesity_iid","pct_south_asian","South Asian ethnicity (% population)","5 percentage points",1.03620047386979,1.00925779669379,1.06494620457528,0.995
+"adult_obesity_iid","pct_age35plus","Mothers aged 35+ (% deliveries)","5 percentage points",0.979364403841125,0.913851196979108,1.05270700236099,0.2805
+"adult_obesity_iid","pct_smoking","Smoking at time of delivery (%)","2 percentage points",1.00955549373039,0.942657338533122,1.08102357459305,0.5955
+"adult_obesity_iid","pct_obese_adult","Adult obesity (%)","5 percentage points",1.02740823358409,0.96413625926112,1.09348125918805,0.8045
+"adult_obesity_bym2","imd_dep_pctile","Deprivation (IMD 2025, mean LSOA percentile)","10 percentile points",1.02617363279652,0.976317651864285,1.07955777451344,0.84725
+"adult_obesity_bym2","pct_black","Black ethnicity (% population)","5 percentage points",1.06049597158502,0.993173684234786,1.13120476239879,0.961
+"adult_obesity_bym2","pct_south_asian","South Asian ethnicity (% population)","5 percentage points",1.03643416866368,1.00848824572835,1.06484205472782,0.99375
+"adult_obesity_bym2","pct_age35plus","Mothers aged 35+ (% deliveries)","5 percentage points",0.98180055852101,0.91023467127656,1.05405635944028,0.308
+"adult_obesity_bym2","pct_smoking","Smoking at time of delivery (%)","2 percentage points",1.00347996306305,0.929054724021377,1.0803401722697,0.536
+"adult_obesity_bym2","pct_obese_adult","Adult obesity (%)","5 percentage points",1.02512656814604,0.962931896170617,1.09219188489236,0.7765
+"adult_obesity_leroux","imd_dep_pctile","Deprivation (IMD 2025, mean LSOA percentile)","10 percentile points",1.02969145940928,0.980892392515158,1.08150862514593,0.8865
+"adult_obesity_leroux","pct_black","Black ethnicity (% population)","5 percentage points",1.05308962951607,0.988088155347141,1.11969413696815,0.943
+"adult_obesity_leroux","pct_south_asian","South Asian ethnicity (% population)","5 percentage points",1.03639422446305,1.00824016375323,1.06538407435169,0.99475
+"adult_obesity_leroux","pct_age35plus","Mothers aged 35+ (% deliveries)","5 percentage points",0.979956938547581,0.913132135138988,1.0505564356306,0.29275
+"adult_obesity_leroux","pct_smoking","Smoking at time of delivery (%)","2 percentage points",1.00681694657438,0.933523062304284,1.0809620139226,0.57
+"adult_obesity_leroux","pct_obese_adult","Adult obesity (%)","5 percentage points",1.02446824702178,0.961080835770892,1.09051288391225,0.7865
+"main_wider_prior","imd_dep_pctile","Deprivation (IMD 2025, mean LSOA percentile)","10 percentile points",1.03442126811785,0.986401042767797,1.08639664385309,0.91625
+"main_wider_prior","pct_black","Black ethnicity (% population)","5 percentage points",1.04257211390694,0.974010477251945,1.11651911496103,0.875
+"main_wider_prior","pct_south_asian","South Asian ethnicity (% population)","5 percentage points",1.04651900534773,1.01171863226569,1.08440860543245,0.997
+"main_wider_prior","pct_age35plus","Mothers aged 35+ (% deliveries)","5 percentage points",1.03540620039253,0.908507190265779,1.18272376360762,0.697
+"main_wider_prior","pct_smoking","Smoking at time of delivery (%)","2 percentage points",1.00337626842121,0.931701103812797,1.08123056330557,0.53275
+"main_wider_prior","pct_obese_preg","Obesity in early pregnancy (%)","5 percentage points",1.11686954657292,0.93952675160349,1.34367653540938,0.89375
+"main_excl_dq","imd_dep_pctile","Deprivation (IMD 2025, mean LSOA percentile)","10 percentile points",1.04027642432483,0.983896287196577,1.10127009574896,0.92075
+"main_excl_dq","pct_black","Black ethnicity (% population)","5 percentage points",1.06027565748706,0.983512927141427,1.15014163148325,0.93375
+"main_excl_dq","pct_south_asian","South Asian ethnicity (% population)","5 percentage points",1.03671824012151,0.997284606797361,1.07802839527966,0.9625
+"main_excl_dq","pct_age35plus","Mothers aged 35+ (% deliveries)","5 percentage points",1.02044065754923,0.878807347761078,1.17734009374208,0.6135
+"main_excl_dq","pct_smoking","Smoking at time of delivery (%)","2 percentage points",1.00585980324832,0.920868124885067,1.09051154728185,0.556
+"main_excl_dq","pct_obese_preg","Obesity in early pregnancy (%)","5 percentage points",1.11995932338789,0.923048289279575,1.35702485060803,0.87875
