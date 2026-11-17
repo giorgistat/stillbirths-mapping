@@ -1,75 +1,109 @@
 # stillbirthmap
 
-R package with the data and code for a Bayesian small-area analysis of stillbirth risk
-across English local authority districts, prepared for *Paediatric and Perinatal
-Epidemiology*. It reanalyses and extends Ranveer Basra's MSc thesis (University of
-Birmingham, 2026).
+R package with the data and code to reproduce the analysis in
+
+> Giorgi E, Basra R, Heazell AEP. *Mapping stillbirth risk across local authorities in England
+> by integrating multiple national data sources.* Manuscript in preparation for *Paediatric and
+> Perinatal Epidemiology*.
+
+The analysis estimates stillbirth rates for the 294 local authority districts (LADs) of England
+using 2024 birth registrations. It combines several national data sources published at
+different geographical levels in a single statistical model. Exceedance probabilities are then
+used to identify districts whose stillbirth rate is likely to be above national benchmarks. The
+work builds on Ranveer Basra's MSc thesis (University of Birmingham, 2026).
 
 ## Installation
 
+Model fitting uses Stan through `cmdstanr`, which needs a one-off installation of CmdStan:
+
 ```r
-# CmdStan is needed for model fitting (once):
 install.packages("cmdstanr", repos = c("https://stan-dev.r-universe.dev", getOption("repos")))
 cmdstanr::install_cmdstan()
 
-# the package
 remotes::install_github("giorgistat/stillbirths-mapping")
 ```
 
 ## Data
 
-All datasets load with `data()`:
+All datasets are public aggregate statistics released under the Open Government Licence. They
+load with `data()`:
 
 | Dataset | Contents |
 |---|---|
-| `stillbirths_lad_2024` | 294 modelling units: live births, stillbirths (≥24 weeks) and covariates, 2024 registrations (main analysis) |
+| `stillbirths_lad_2024` | 294 LADs: live births, stillbirths (24+ weeks) and covariates, 2024 registrations (main analysis) |
 | `stillbirths_lad_2025` | Same for 2025 registrations |
-| `lad_sf` | Boundaries of the 294 units (`sf`, EPSG:27700) |
-| `lad_nb` | Queen adjacency (`spdep::nb`); Isle of Wight linked to Portsmouth, Southampton, New Forest |
-| `lad_utla_lookup` | Unit → upper-tier local authority |
-| `obesity_pregnancy_utla` | Obesity in early pregnancy (Fingertips 94131), upper-tier authorities, 2022/23–2023/24 |
+| `lad_sf` | LAD boundaries (`sf`, EPSG:27700) |
+| `lad_nb` | Queen adjacency (`spdep::nb`); Isle of Wight linked to Portsmouth, Southampton and New Forest |
+| `lad_utla_lookup` | LAD to upper-tier local authority lookup |
+| `obesity_pregnancy_utla` | Obesity in early pregnancy (OHID Fingertips 94131), upper-tier authorities, 2022/23 and 2023/24 |
 
-Modelling units are LADs (May 2024 boundaries), with Cornwall + Isles of Scilly and
-Hackney + City of London merged because their data are published combined.
+LADs follow the May 2024 boundaries. Cornwall and the Isles of Scilly, and Hackney and the City of
+London, are merged because their data are published combined.
 
-Covariates:
-- deprivation: mean LSOA deprivation percentile, IoD 2025;
-- % Black and % South Asian: Census 2021, whole population;
-- % deliveries to mothers aged 35+, % smoking at time of delivery and % adult obesity: Fingertips 2024/25;
-- obesity in early pregnancy: upper-tier values only, modelled at LAD level (see below).
+Stillbirths and births come from ONS birth registrations. The covariates are:
 
-Sources are in `data-raw/sources/`, and `data-raw/make_datasets.R` rebuilds `data/`. All are public
-aggregate statistics under the Open Government Licence.
+| Covariate | Source | Level published |
+|---|---|---|
+| Deprivation (mean LSOA percentile) | English Indices of Deprivation 2025 | LSOA, averaged to LAD |
+| % Black, % South Asian (whole population) | Census 2021 | LAD |
+| % deliveries to mothers aged 35+ | OHID Fingertips, 2024/25 | LAD |
+| % smoking at time of delivery | OHID Fingertips, 2024/25 | LAD |
+| % adult obesity (obesity sub-model and sensitivity analysis) | OHID Fingertips (Active Lives Survey), 2024/25 | LAD |
+| % women with BMI 30+ at the booking appointment | OHID Fingertips 94131 | Upper-tier authority, about a third withheld |
+
+The raw files are in `data-raw/sources/`, and `data-raw/make_datasets.R` rebuilds `data/`.
 
 ## Model
+
+Stillbirth counts are analysed with a Poisson generalised linear mixed model. The log of total
+births is used as an offset, and each LAD has an independent normal random effect.
+
+Obesity in early pregnancy is published only for upper-tier authorities, and about a third of
+those values are withheld. It is therefore treated as a latent LAD-level variable, predicted from
+adult obesity, maternal age, deprivation, ethnicity and smoking, with an upper-tier random effect.
+The published values are modelled as births-weighted averages of the latent LAD values, with
+binomial sampling error, extra measurement error and a shift between the two years. This
+measurement model is fitted jointly with the stillbirth model, so uncertainty about obesity is
+carried through to all outputs. The Stan code is in `inst/stan/`.
+
+All covariates are pre-specified and kept in the model. Ten-fold cross-validation, scored with
+the log score and the ranked probability score, is used descriptively to compare models and to
+measure each covariate's predictive contribution.
+
+Exceedance probabilities are computed for four thresholds:
+
+- the England rate;
+- England +10%;
+- England +20%;
+- the national ambition of 2.6 per 1,000 births.
+
+LADs are classified as high risk if the probability is above 0.8 and low risk if it is below 0.2.
+
+BYM2 and Leroux spatial random effects are available through `random_effect =`. They did not
+improve the fit and are reported only in the supplementary material.
 
 ```r
 library(stillbirthmap)
 data(stillbirths_lad_2024)
-fit <- fit_stillbirth_model(stillbirths_lad_2024)   # main model
+fit <- fit_stillbirth_model(stillbirths_lad_2024)   # main model (joint obesity sub-model)
 fit                                                 # rate ratios
-exc <- exceedance(fit)                              # P(rate > England, +10%, +20%, 2.6)
+exc <- exceedance(fit)                              # exceedance probabilities and classes
 map_exceedance(exc)
 ```
-
-- **Stillbirth model.** Stillbirths are Poisson with offset log(total births) and IID LAD random
-  effects, with a half-normal(0, 1) prior on their SD. BYM2 and Leroux CAR random effects are
-  available as sensitivity analyses via `random_effect =`.
-- **Obesity in early pregnancy.** If `"pct_obese_preg"` is among the covariates (as in the default,
-  `main_covariates()`), obesity in pregnancy is a latent LAD-level variable. It is predicted from
-  adult obesity, maternal age, deprivation, ethnicity and smoking, plus an upper-tier random
-  effect. It is linked to the published upper-tier values (births-weighted averages with binomial
-  error) and fitted jointly with the stillbirth model. Hospital booking data can be added through
-  `obesity_extra`.
-- **Covariate choice.** All covariates are pre-specified and kept. Cross-validation is used only
-  descriptively: `cross_validate()` and `summarise_cv()` compare models, and `drop_one_cv()`
-  measures each covariate's predictive contribution (log score and ranked probability score).
 
 ## Reproducing the paper
 
 ```
 R CMD INSTALL .
-Rscript analysis/run_analysis_2024.R     # ~45 min on 2 cores; results in output/2024/
+Rscript analysis/run_analysis_2024.R     # about 45 minutes on 2 cores
 ```
 
+Results are written to `output/2024/`: rate ratios, model parameters, exceedance probabilities
+for every LAD, latent obesity estimates, cross-validation summaries, residual checks and
+figures.
+
 `legacy/ranveer_msc/` holds the original thesis R Markdown files for reference.
+
+## Licence
+
+MIT. The data are reused under the Open Government Licence v3.0.
