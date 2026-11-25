@@ -115,6 +115,7 @@ map_exceedance(exc)
 ```
 R CMD INSTALL .
 Rscript analysis/run_analysis_2024.R     # about 45 minutes on 2 cores
+Rscript analysis/cv_calibration_2024.R   # calibration checks, Figures S3 and S4
 ```
 
 Results are written to `output/2024/`: rate ratios, model parameters, exceedance probabilities

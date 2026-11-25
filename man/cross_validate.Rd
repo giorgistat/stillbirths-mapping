@@ -11,6 +11,7 @@ cross_validate(
   random_effect = "iid",
   iter_warmup = 500,
   iter_sampling = 500,
+  keep_draws = FALSE,
   ...
 )
 }
@@ -26,6 +27,10 @@ for the joint obesity model. Default [main_covariates()].}
 supports `"iid"` only.}
 
 \item{iter_warmup, iter_sampling}{MCMC iterations per fold.}
+
+\item{keep_draws}{If `TRUE`, the posterior draws of the held-out rates (per 1,000 total
+births; draws x units, columns in the order of `data`) are attached as attribute
+`"rate_draws"`, so that replicate counts can be simulated from the predictive distribution.}
 
 \item{...}{Further arguments to [fit_stillbirth_model()].}
 }

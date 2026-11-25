@@ -42,21 +42,33 @@ score_counts <- function(y, log_offset, log_rate_draws) {
 #' @param folds Fold labels from [make_folds()].
 #' @param iter_warmup,iter_sampling MCMC iterations per fold.
 #' @param ... Further arguments to [fit_stillbirth_model()].
+#' @param keep_draws If `TRUE`, the posterior draws of the held-out rates (per 1,000 total
+#'   births; draws x units, columns in the order of `data`) are attached as attribute
+#'   `"rate_draws"`, so that replicate counts can be simulated from the predictive distribution.
 #' @return Pointwise scores with unit, fold and observed count.
 #' @export
 cross_validate <- function(data, covariates, folds = make_folds(data), random_effect = "iid",
-                           iter_warmup = 500, iter_sampling = 500, ...) {
+                           iter_warmup = 500, iter_sampling = 500, keep_draws = FALSE, ...) {
+  draws <- NULL
   out <- lapply(sort(unique(folds)), function(k) {
     test <- which(folds == k)
     f <- fit_stillbirth_model(data, covariates, random_effect = random_effect, holdout = test,
                               iter_warmup = iter_warmup, iter_sampling = iter_sampling,
                               seed = 100 + k, ...)
-    lr <- log(rate_draws(f) / 1000)[, test, drop = FALSE]
+    rd <- rate_draws(f)[, test, drop = FALSE]
+    if (keep_draws) draws[[k]] <<- rd
+    lr <- log(rd / 1000)
     cbind(data.frame(unit = data$unit[test], fold = k, y = data$stillbirths[test],
                      births = data$total_births[test]),
           score_counts(data$stillbirths[test], log(data$total_births[test]), lr))
   })
-  do.call(rbind, out)
+  res <- do.call(rbind, out)
+  if (keep_draws) {
+    m <- matrix(NA_real_, nrow(draws[[1]]), nrow(data), dimnames = list(NULL, data$unit))
+    for (k in seq_along(draws)) m[, folds == sort(unique(folds))[k]] <- draws[[k]]
+    attr(res, "rate_draws") <- m
+  }
+  res
 }
 
 #' Summarise cross-validation results against a reference model
